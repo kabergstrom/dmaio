@@ -19,8 +19,5 @@ winapi = { version = "0.3", features = [
     "sysinfoapi"
 ] }
 async-task = "3"
-lock_api = "0.3"
-
-[features]
-default = ["std"]
-std = []
+parking_lot = "0.10"
+smallvec = "1"

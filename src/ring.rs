@@ -280,8 +280,12 @@ mod test {
 
     #[test]
     fn test_simple() {
-        let buffer = Ring::new(128);
+        let buffer = Ring::new(4);
         assert_eq!(buffer.push(5u32), None);
+        assert_eq!(buffer.push(5u32), None);
+        assert_eq!(buffer.push(5u32), None);
+        assert_eq!(buffer.pop_single(), Some(5u32));
+        assert_eq!(buffer.pop_single(), Some(5u32));
         assert_eq!(buffer.pop_single(), Some(5u32));
         assert_eq!(buffer.pop_single(), None);
     }

@@ -1,11 +1,13 @@
 #![allow(non_snake_case)]
 use crate::alloc::sync::Arc;
-use crate::buffer::BufferRef;
-use crate::buffer::{IntoBufferRef, UserBufferRef};
+use crate::buffer::{BufferRef, RawBufferRef};
 use crate::rio_buf::RIOPacketBuf;
 use crate::{Error, Result};
 use core::mem::{size_of, MaybeUninit};
 use core::ptr::null_mut;
+use parking_lot::Mutex;
+use smallvec::SmallVec;
+use std::task::Waker;
 use winapi::{
     ctypes::c_int,
     shared::{
@@ -15,7 +17,7 @@ use winapi::{
         ws2def::{self, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER},
     },
     um::{
-        minwinbase::OVERLAPPED,
+        minwinbase::{OVERLAPPED_u, OVERLAPPED},
         mswsock::{
             self, RIO_EXTENSION_FUNCTION_TABLE, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION,
         },
@@ -27,12 +29,12 @@ use winapi::{
 use winapi::shared::mswsockdef::{
     PRIORESULT, PRIO_BUF, RIORESULT, RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ,
     RIO_INVALID_BUFFERID, RIO_INVALID_CQ, RIO_INVALID_RQ, RIO_MSG_COMMIT_ONLY, RIO_MSG_DEFER,
-    RIO_RQ,
+    RIO_MSG_DONT_NOTIFY, RIO_RQ,
 };
 use winapi::shared::winerror::ERROR_SUCCESS;
 use winapi::um::mswsock::PRIO_NOTIFICATION_COMPLETION;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RIOOpType {
     None,
     Send,
@@ -281,32 +283,135 @@ pub unsafe fn init_rio() -> Result<()> {
     }
 }
 
-#[derive(Clone)]
-pub struct RIOSocket {
+struct RIOSocketState {
+    pub send_slots_open: u32,
+    pub pending_send_wakers: SmallVec<[Waker; 1]>,
+    pub recv_slots_open: u32,
+    pub pending_recv_wakers: SmallVec<[Waker; 1]>,
+}
+
+struct RIOSocketInner {
     pub socket: SOCKET,
     pub rq: RIO_RQ,
-    pub send_cq: RIO_CQ,
-    pub receive_cq: RIO_CQ,
+    pub send_cq: RIOQueue,
+    pub receive_cq: RIOQueue,
+    pub total_send_slots: u32,
+    pub total_recv_slots: u32,
+    // the state mutex is used to protect usage of the RIO_RQ for SendEx and ReceiveEx
+    pub state: Mutex<RIOSocketState>,
 }
+unsafe impl Send for RIOSocketInner {}
+unsafe impl Sync for RIOSocketInner {}
+impl Drop for RIOSocketInner {
+    fn drop(&mut self) {
+        self.send_cq.release_queue_slots(self.total_send_slots);
+        self.receive_cq.release_queue_slots(self.total_recv_slots);
+        unsafe { winsock2::closesocket(self.socket) };
+    }
+}
+#[derive(Clone)]
+pub struct RIOSocket(Arc<RIOSocketInner>);
 impl RIOSocket {
-    pub fn receive_ex<T: Default>(&self, mut packet: RIOPacketBuf<T>) -> Result<()> {
+    pub fn new_tcp(
+        send_queue: &RIOQueue,
+        concurrent_sends: u32,
+        receive_queue: &RIOQueue,
+        concurrent_receives: u32,
+    ) -> Result<Self> {
+        Self::new_internal(
+            winsock2::SOCK_STREAM,
+            ws2def::IPPROTO_TCP as c_int,
+            0,
+            send_queue,
+            concurrent_sends,
+            receive_queue,
+            concurrent_receives,
+        )
+    }
+    pub fn new_udp(
+        send_queue: &RIOQueue,
+        concurrent_sends: u32,
+        receive_queue: &RIOQueue,
+        concurrent_receives: u32,
+    ) -> Result<Self> {
+        Self::new_internal(
+            winsock2::SOCK_DGRAM,
+            ws2def::IPPROTO_UDP as c_int,
+            0,
+            send_queue,
+            concurrent_sends,
+            receive_queue,
+            concurrent_receives,
+        )
+    }
+    fn new_internal(
+        _type: c_int,
+        protocol: c_int,
+        flags: DWORD,
+        send_queue: &RIOQueue,
+        concurrent_sends: u32,
+        receive_queue: &RIOQueue,
+        concurrent_receives: u32,
+    ) -> Result<Self> {
+        send_queue.reserve_queue_slots(concurrent_sends)?;
+        match receive_queue.reserve_queue_slots(concurrent_receives) {
+            Err(err) => {
+                send_queue.release_queue_slots(concurrent_sends);
+                Err(err)?
+            }
+            Ok(()) => {}
+        }
+
+        match unsafe {
+            create_rio_socket(
+                _type,
+                protocol,
+                flags,
+                receive_queue.cq(),
+                send_queue.cq(),
+                concurrent_receives,
+                concurrent_sends,
+            )
+        } {
+            Err(err) => {
+                send_queue.release_queue_slots(concurrent_sends);
+                receive_queue.release_queue_slots(concurrent_receives);
+                Err(err)?
+            }
+            Ok((socket, rq)) => Ok(RIOSocket(Arc::new(RIOSocketInner {
+                socket,
+                rq,
+                send_cq: send_queue.clone(),
+                receive_cq: receive_queue.clone(),
+                total_recv_slots: concurrent_receives,
+                total_send_slots: concurrent_sends,
+                state: Mutex::new(RIOSocketState {
+                    send_slots_open: concurrent_sends,
+                    recv_slots_open: concurrent_receives,
+                    pending_recv_wakers: SmallVec::new(),
+                    pending_send_wakers: SmallVec::new(),
+                }),
+            }))),
+        }
+    }
+    pub fn receive_ex<T: AsMut<RIOPacketBuf>>(&self, mut packet: BufferRef<T>) -> Result<()> {
+        let mut state_guard = self.0.state.lock();
+        if state_guard.recv_slots_open == 0 {
+            return Err(Error::SlotsExhausted);
+        }
         unsafe {
-            let mut data_buf = packet.data_rio_buf();
-            let mut local_addr_buf = packet.local_addr_rio_buf();
-            let mut remote_addr_buf = packet.remote_addr_rio_buf();
-            let local_addr_param = if packet.local_addr().is_some() {
-                &mut local_addr_buf as PRIO_BUF
-            } else {
-                null_mut()
-            };
-            let remote_addr_param = if packet.remote_addr().is_some() {
-                &mut remote_addr_buf as PRIO_BUF
-            } else {
-                null_mut()
-            };
-            packet.header_mut().active_op = RIOOpType::Receive;
+            // println!("start op {:?}", RIOOpType::Receive);
+            let (mut header, raw) = packet.parts_mut();
+            let mut header = header.as_mut();
+            let mut data_buf = header.data_rio_buf(raw, raw.buffer_header().data_capacity());
+            let mut local_addr_buf = header.local_addr_rio_buf(raw);
+            let mut remote_addr_buf = header.remote_addr_rio_buf(raw);
+            let local_addr_param = &mut local_addr_buf as PRIO_BUF;
+            let remote_addr_param = &mut remote_addr_buf as PRIO_BUF;
+            header.active_op = RIOOpType::Receive;
+            header.op_socket = Some(self.clone());
             rio_vtable().ReceiveEx(
-                self.rq,
+                self.0.rq,
                 &mut data_buf as PRIO_BUF,
                 1,
                 local_addr_param,
@@ -314,15 +419,16 @@ impl RIOSocket {
                 null_mut(),
                 null_mut(),
                 RIO_MSG_DEFER,
-                packet.into_raw() as PVOID,
+                packet.into_raw().into_raw() as PVOID,
             )?;
+            state_guard.recv_slots_open -= 1;
             Ok(())
         }
     }
     pub fn commit_receive_ex(&self) -> Result<()> {
         unsafe {
             rio_vtable().ReceiveEx(
-                self.rq,
+                self.0.rq,
                 null_mut(),
                 0,
                 null_mut(),
@@ -332,14 +438,14 @@ impl RIOSocket {
                 RIO_MSG_COMMIT_ONLY,
                 null_mut(),
             )?;
-            rio_vtable().Notify(self.send_cq)?;
+            rio_vtable().Notify(self.0.send_cq.cq())?;
         }
         Ok(())
     }
     pub fn commit_send_ex(&self) -> Result<()> {
         unsafe {
             rio_vtable().SendEx(
-                self.rq,
+                self.0.rq,
                 null_mut(),
                 0,
                 null_mut(),
@@ -349,28 +455,52 @@ impl RIOSocket {
                 RIO_MSG_COMMIT_ONLY,
                 null_mut(),
             )?;
-            rio_vtable().Notify(self.send_cq)?;
+            rio_vtable().Notify(self.0.send_cq.cq())?;
         }
         Ok(())
     }
-    pub fn send_ex<T: Default>(&self, mut packet: RIOPacketBuf<T>) -> Result<()> {
+    fn complete_send(&self) {
+        let mut state_guard = self.0.state.lock();
+        state_guard.send_slots_open += 1;
+        if let Some(waker) = state_guard.pending_send_wakers.pop() {
+            waker.wake();
+        }
+    }
+    fn complete_receive(&self) {
+        let mut state_guard = self.0.state.lock();
+        state_guard.recv_slots_open += 1;
+        if let Some(waker) = state_guard.pending_recv_wakers.pop() {
+            waker.wake();
+        }
+    }
+    pub fn send_ex<T: AsMut<RIOPacketBuf>>(&self, mut packet: BufferRef<T>) -> Result<()> {
+        let mut state_guard = self.0.state.lock();
+        if state_guard.send_slots_open == 0 {
+            return Err(Error::SlotsExhausted);
+        }
         unsafe {
-            let mut data_buf = packet.data_rio_buf();
-            let mut local_addr_buf = packet.local_addr_rio_buf();
-            let mut remote_addr_buf = packet.remote_addr_rio_buf();
-            let local_addr_param = if packet.local_addr().is_some() {
+            let (mut header, raw) = packet.parts_mut();
+            let mut header = header.as_mut();
+            let mut data_buf = header.data_rio_buf(raw, raw.buffer_header().data_size());
+            let mut local_addr_buf = header.local_addr_rio_buf(raw);
+            let mut remote_addr_buf = header.remote_addr_rio_buf(raw);
+            let local_addr_param = if header.local_addr(raw).is_some() {
                 &mut local_addr_buf as PRIO_BUF
             } else {
                 null_mut()
             };
-            let remote_addr_param = if packet.remote_addr().is_some() {
+            let remote_addr_param = if header.remote_addr().is_some() {
                 &mut remote_addr_buf as PRIO_BUF
             } else {
                 null_mut()
             };
-            packet.header_mut().active_op = RIOOpType::Send;
+            header.op_socket = Some(self.clone());
+            debug_assert!(data_buf.Length > 0);
+            debug_assert!(data_buf.BufferId != RIO_INVALID_BUFFERID);
+            header.active_op = RIOOpType::Send;
+            // println!("start op {:?}", RIOOpType::Send);
             rio_vtable().SendEx(
-                self.rq,
+                self.0.rq,
                 &mut data_buf as PRIO_BUF,
                 1,
                 local_addr_param,
@@ -378,63 +508,77 @@ impl RIOSocket {
                 null_mut(),
                 null_mut(),
                 RIO_MSG_DEFER,
-                packet.into_raw() as PVOID,
+                packet.into_raw().into_raw() as PVOID,
             )?;
+            state_guard.send_slots_open -= 1;
             Ok(())
         }
     }
+    pub fn set_recv_buffer_size(&self, buf_size: usize) -> Result<()> {
+        let mut buffer_size: i32 = buf_size as i32;
+        let buffer_sizeof = size_of::<i32>() as i32;
+        let retval = unsafe {
+            winsock2::setsockopt(
+                self.0.socket,
+                ws2def::SOL_SOCKET,
+                ws2def::SO_RCVBUF,
+                &mut buffer_size as *mut _ as PCHAR,
+                buffer_sizeof,
+            )
+        };
+        if retval != 0 {
+            Err(Error::WSAErr("setsockopt", retval))
+        } else {
+            Ok(())
+        }
+    }
+    pub fn set_send_buffer_size(&self, buf_size: usize) -> Result<()> {
+        let mut buffer_size: i32 = buf_size as i32;
+        let buffer_sizeof = size_of::<i32>() as i32;
+        let retval = unsafe {
+            winsock2::setsockopt(
+                self.0.socket,
+                ws2def::SOL_SOCKET,
+                ws2def::SO_SNDBUF,
+                &mut buffer_size as *mut _ as PCHAR,
+                buffer_sizeof,
+            )
+        };
+        if retval != 0 {
+            Err(Error::WSAErr("setsockopt", retval))
+        } else {
+            Ok(())
+        }
+    }
+    pub fn bind(&self, addr: std::net::SocketAddr) -> Result<()> {
+        unsafe { bind_socket(self, addr) }
+    }
 }
-pub unsafe fn create_rio_socket(
+unsafe fn create_rio_socket(
     _type: c_int,
     protocol: c_int,
     flags: DWORD,
-    receive_cq: &RIOQueue,
-    send_cq: &RIOQueue,
+    receive_cq: RIO_CQ,
+    send_cq: RIO_CQ,
     max_outstanding_receive: ULONG,
     max_outstanding_send: ULONG,
-) -> Result<RIOSocket> {
+) -> Result<(SOCKET, RIO_RQ)> {
     let socket = create_socket(
         _type,
         protocol,
         flags | winsock2::WSA_FLAG_REGISTERED_IO | winsock2::WSA_FLAG_OVERLAPPED,
     )?;
-
-    // let mut buffer_size = 2048 * 1024;
-    // let buffer_sizeof = size_of::<i32>() as i32;
-    // debug_assert!(
-    //     winsock2::setsockopt(
-    //         socket,
-    //         ws2def::SOL_SOCKET,
-    //         ws2def::SO_SNDBUF,
-    //         &mut buffer_size as *mut _ as PCHAR,
-    //         buffer_sizeof,
-    //     ) == 0
-    // );
-    // debug_assert!(
-    //     winsock2::setsockopt(
-    //         socket,
-    //         ws2def::SOL_SOCKET,
-    //         ws2def::SO_RCVBUF,
-    //         &mut buffer_size as *mut _ as PCHAR,
-    //         buffer_sizeof,
-    //     ) == 0
-    // );
     match rio_vtable().CreateRequestQueue(
         socket,
         max_outstanding_receive,
         1,
         max_outstanding_send,
         1,
-        receive_cq.cq,
-        send_cq.cq,
+        receive_cq,
+        send_cq,
         socket as *mut _,
     ) {
-        Ok(rq) => Ok(RIOSocket {
-            socket,
-            rq,
-            send_cq: send_cq.cq,
-            receive_cq: receive_cq.cq,
-        }),
+        Ok(rq) => Ok((socket, rq)),
         Err(err) => {
             winsock2::closesocket(socket);
             Err(err)
@@ -466,43 +610,119 @@ pub unsafe fn wsa_init() -> Result<()> {
 }
 
 pub struct RIOCompletion<T> {
-    pub packet_buf: RIOPacketBuf<T>,
-    pub result: Result<()>,
-    pub op_type: RIOOpType,
+    pub(crate) packet_buf: BufferRef<T>,
+    pub(crate) result: Result<()>,
+    pub(crate) op_type: RIOOpType,
 }
-
-#[derive(Clone)]
-pub struct RIOQueue {
+struct RIOQueueState {
+    results_buffer: Vec<RIORESULT>,
+    socket_slots_open: u32,
+    socket_slots_total: u32,
+}
+pub(crate) struct RIOQueueInner {
     // this OVERLAPPED struct is used when the RIO_CQ is bound with an IO Completion Port,
     // and a pointer to it will be passed in the IO completion packet by RIONotify
     iocp_overlapped: MaybeUninit<OVERLAPPED>,
-    pub cq: RIO_CQ,
-    results_buffer: Vec<RIORESULT>,
+    cq: RIO_CQ,
+    state: Mutex<RIOQueueState>,
 }
+unsafe impl Send for RIOQueueInner {}
+unsafe impl Sync for RIOQueueInner {}
+#[derive(Clone)]
+pub struct RIOQueue(Arc<RIOQueueInner>);
 impl RIOQueue {
-    pub unsafe fn dequeue_completions<T: Default>(
-        &mut self,
+    pub unsafe fn from_overlapped(overlapped: &OVERLAPPED) -> Self {
+        let overlapped_value = Arc::from_raw(*overlapped.u.Pointer() as *const RIOQueueInner);
+        let retval = RIOQueue(Arc::clone(&overlapped_value));
+        core::mem::forget(overlapped_value);
+        retval
+    }
+    pub fn new(
+        iocp_notify: Option<HANDLE>,
+        completion_key: usize,
+        queue_size: u32,
+        results_buffer_size: usize,
+    ) -> Result<Self> {
+        Ok(RIOQueue(unsafe {
+            create_rio_cq(iocp_notify, completion_key, queue_size, results_buffer_size)
+        }?))
+    }
+    fn cq(&self) -> RIO_CQ {
+        self.0.cq
+    }
+    pub fn poke(&self) -> Result<()> {
+        unsafe { rio_vtable().Notify(self.0.cq) }
+    }
+    fn reserve_queue_slots(&self, num_slots: u32) -> Result<()> {
+        let mut state = self.0.state.lock();
+        let mut size = state.socket_slots_total;
+        let mut new_open_slots = 0;
+        while new_open_slots + state.socket_slots_open < num_slots {
+            size = size * 2;
+            new_open_slots = size - state.socket_slots_total;
+        }
+        if new_open_slots > 0 {
+            unsafe { rio_vtable().ResizeCompletionQueue(self.cq(), size)? };
+            state.socket_slots_total = size;
+            state.socket_slots_open += new_open_slots;
+        }
+        state.socket_slots_open -= num_slots;
+        Ok(())
+    }
+    fn release_queue_slots(&self, num_slots: u32) {
+        let mut state = self.0.state.lock();
+        state.socket_slots_open += num_slots;
+    }
+    pub unsafe fn dequeue_completions<T: AsMut<RIOPacketBuf>>(
+        &self,
         results_buf: &mut Vec<RIOCompletion<T>>,
     ) -> Result<usize> {
+        let mut state = self.0.state.lock();
+        let mut results_buffer = &mut state.results_buffer;
         debug_assert!(results_buf.is_empty());
-        debug_assert!(results_buf.len() <= self.results_buffer.capacity());
+        debug_assert!(results_buf.len() <= results_buffer.capacity());
         let num_completions = rio_vtable().DequeueCompletion(
-            self.cq,
-            self.results_buffer.as_mut_ptr(),
-            self.results_buffer.capacity() as u32,
+            self.0.cq,
+            results_buffer.as_mut_ptr(),
+            results_buffer.capacity() as u32,
         )? as usize;
-        self.results_buffer.set_len(num_completions);
+        results_buffer.set_len(num_completions);
         for i in 0..num_completions {
-            let rio_result = self.results_buffer.get_unchecked(i);
-            let mut packet_buf = RIOPacketBuf::<T>::from_raw(rio_result.RequestContext as *mut u8);
+            let rio_result = results_buffer.get_unchecked(i);
+            let mut packet_buf = BufferRef::<T>::from_raw(RawBufferRef::from_raw(
+                rio_result.RequestContext as *mut u8,
+            ));
             let result = if rio_result.Status == 0 {
                 Ok(())
             } else {
                 Err(Error::WSAErr("RIORESULT", rio_result.Status))
             };
-            let header_mut = packet_buf.header_mut();
+            let mut header_mut = AsMut::<RIOPacketBuf>::as_mut(packet_buf.user_header_mut());
             let op_type = header_mut.active_op;
             header_mut.active_op = RIOOpType::None;
+            match op_type {
+                RIOOpType::Send => {
+                    let socket = header_mut
+                        .op_socket
+                        .take()
+                        .expect("socket was not set when completing a RIO send");
+                    socket.complete_send();
+                }
+                RIOOpType::Receive => {
+                    let socket = header_mut
+                        .op_socket
+                        .take()
+                        .expect("socket was not set when completing a RIO receive");
+                    socket.complete_receive();
+                    if result.is_ok() {
+                        packet_buf
+                            .raw_mut()
+                            .buffer_header_mut()
+                            .set_data_size(rio_result.BytesTransferred);
+                    }
+                }
+                _ => {}
+            }
             let completion = RIOCompletion {
                 packet_buf,
                 result,
@@ -514,38 +734,56 @@ impl RIOQueue {
         Ok(num_completions)
     }
 }
+impl Drop for RIOQueueInner {
+    fn drop(&mut self) {
+        unsafe { rio_vtable().CloseCompletionQueue(self.cq) };
+    }
+}
 
-pub unsafe fn create_rio_cq(
+unsafe fn create_rio_cq(
     iocp_notify: Option<HANDLE>,
-    queue_size: usize,
+    completion_key: usize,
+    queue_size: u32,
     results_buffer_size: usize,
-) -> Result<Arc<RIOQueue>> {
-    let mut rio_queue_alloc = Arc::new(RIOQueue {
+) -> Result<Arc<RIOQueueInner>> {
+    let mut rio_queue_alloc = Arc::new(RIOQueueInner {
         iocp_overlapped: MaybeUninit::zeroed(),
         cq: RIO_INVALID_CQ,
-        results_buffer: Vec::with_capacity(results_buffer_size),
+        state: Mutex::new(RIOQueueState {
+            results_buffer: Vec::with_capacity(results_buffer_size),
+            socket_slots_open: queue_size,
+            socket_slots_total: queue_size,
+        }),
     });
     let mut iocp_registration = RIO_NOTIFICATION_COMPLETION::default();
-    let rio_queue_alloc_mut = Arc::make_mut(&mut rio_queue_alloc);
     let notification = if let Some(iocp) = iocp_notify {
         iocp_registration.Type = RIO_IOCP_COMPLETION;
         iocp_registration.u.Iocp_mut().IocpHandle = iocp;
+        iocp_registration.u.Iocp_mut().CompletionKey = completion_key as PVOID;
         iocp_registration.u.Iocp_mut().Overlapped =
-            rio_queue_alloc_mut.iocp_overlapped.as_mut_ptr() as *mut _;
+            rio_queue_alloc.iocp_overlapped.as_ptr() as *mut _;
         &mut iocp_registration as *mut _
     } else {
         null_mut()
     };
-    rio_queue_alloc_mut.cq = rio_vtable().CreateCompletionQueue(queue_size as u32, notification)?;
+    // this is sound since we have the only ref to the Arc
+    *(&rio_queue_alloc.cq as *const RIO_CQ as *mut RIO_CQ) =
+        rio_vtable().CreateCompletionQueue(queue_size as u32, notification)?;
+    let mut overlapped = OVERLAPPED::default();
+    *overlapped.u.Pointer_mut() = Arc::into_raw(Arc::clone(&rio_queue_alloc)) as PVOID;
+    core::ptr::write(
+        rio_queue_alloc.iocp_overlapped.as_ptr() as *mut OVERLAPPED,
+        overlapped,
+    );
     Ok(rio_queue_alloc)
 }
 
-pub unsafe fn bind_socket(socket: &RIOSocket, socket_addr: std::net::SocketAddr) -> Result<()> {
+unsafe fn bind_socket(socket: &RIOSocket, socket_addr: std::net::SocketAddr) -> Result<()> {
     let mut addr = ws2def::SOCKADDR_STORAGE::default();
     write_sockaddr(&mut addr, Some(socket_addr));
 
     if winsock2::bind(
-        socket.socket,
+        socket.0.socket,
         &addr as *const _ as *const _,
         size_of::<ws2def::SOCKADDR_STORAGE>() as c_int,
     ) != 0
@@ -598,10 +836,19 @@ pub(crate) unsafe fn read_sockaddr(
                     addr_bytes.s_b3,
                     addr_bytes.s_b4,
                 ),
-                inet_addr.sin_port,
+                inet_addr.sin_port.swap_bytes(),
             )))
         }
         0 => None,
         _ => unimplemented!(),
     }
+}
+
+pub enum RIOOpCompletion<T> {
+    Send(BufferRef<T>),
+    Receive {
+        buffer: BufferRef<T>,
+        local_addr: Option<std::net::SocketAddr>,
+        remote_addr: Option<std::net::SocketAddr>,
+    },
 }
