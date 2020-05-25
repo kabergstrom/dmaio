@@ -7,12 +7,10 @@
 // #[cfg(feature = "std")]
 use std as alloc;
 
-mod buffer;
+pub mod buffer;
 mod cache_padded;
 mod iocp;
-mod mempool;
 mod net_api;
-mod pkt_buf;
 mod ring;
 mod rio;
 mod rio_buf;
@@ -78,7 +76,7 @@ const SOCKET_BUF_SIZE: u32 = SEND_OPS_IN_FLIGHT * PACKET_SIZE * 1;
 const PACKETS_TO_SEND: usize = 100_000;
 
 async fn recv_loop(
-    packet_pool: mempool::MemPool<IOPacketPool>,
+    packet_pool: buffer::BufferPool<IOPacketPool>,
     net_context: NetContext<IOPacketHeader>,
     server_addr: std::net::SocketAddr,
 ) -> Result<()> {
@@ -88,12 +86,8 @@ async fn recv_loop(
     let mut packets_received = 0;
     loop {
         let recv_packet = packet_pool.alloc().await;
-        let recv_packet2 = packet_pool.alloc().await;
         let recv1 = server_socket.receive(recv_packet);
-        let recv2 = server_socket.receive(recv_packet2);
         let (recv_packet, result) = recv1.await;
-        result?;
-        let (recv_packet2, result) = recv2.await;
         result?;
         packets_received += 1;
         if packets_received % 10000 == 0 {
@@ -102,7 +96,7 @@ async fn recv_loop(
     }
 }
 async fn send_loop(
-    packet_pool: mempool::MemPool<IOPacketPool>,
+    packet_pool: buffer::BufferPool<IOPacketPool>,
     net_context: NetContext<IOPacketHeader>,
     server_addr: std::net::SocketAddr,
     client_addr: std::net::SocketAddr,
@@ -133,9 +127,9 @@ fn main() -> Result<()> {
         rio::wsa_init()?;
         rio::init_rio()?;
     }
-    let packet_pool = mempool::default(
+    let packet_pool = buffer::default_pool(
         1024,
-        Layout::from_size_align(PACKET_SIZE as usize, 64).unwrap(),
+        Layout::from_size_align(PACKET_SIZE as usize, 4096).unwrap(),
         IOPacketPool::default(),
     )?;
     let mut iocp_builder = IOCPQueueBuilder::new(1)?;

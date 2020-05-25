@@ -1,7 +1,6 @@
 #![allow(non_snake_case)]
 use crate::alloc::alloc::Layout;
-use crate::buffer::{BufferRef, RawBufferRef};
-use crate::mempool::{BufferInitializer, CustomMemPool, MemPool, MemPoolHeader};
+use crate::buffer::{BufferHeaderInit, BufferPool, BufferPoolHeader, BufferRef, RawBufferRef};
 use crate::rio::{read_sockaddr, rio_vtable, write_sockaddr, RIOOpType};
 use crate::Result;
 use core::mem::MaybeUninit;
@@ -51,7 +50,7 @@ impl RIOPacketBuf {
         ptr: *const u8,
         size: u32,
     ) -> RIO_BUF {
-        let data_ptr = buf_ref.data_ptr();
+        let data_ptr = buf_ref.data_ptr().as_ptr();
         let diff = if ptr > data_ptr {
             -(ptr.sub(data_ptr as usize) as isize)
         } else {
@@ -68,7 +67,10 @@ impl RIOPacketBuf {
         let header = buf_ref.buffer_header();
         self.make_rio_buf(
             buf_ref,
-            buf_ref.data_ptr().add(header.data_start_offset() as usize) as *const u8,
+            buf_ref
+                .data_ptr()
+                .as_ptr()
+                .add(header.data_start_offset() as usize) as *const u8,
             size,
         )
     }
@@ -116,23 +118,24 @@ impl Default for RIOPacketPool {
         }
     }
 }
-impl CustomMemPool for RIOPacketPool {
+impl BufferHeaderInit for RIOPacketPool {
     type Header = RIOPacketBuf;
 
-    fn initialize_self(&mut self, mempool: &crate::mempool::MemPoolHeader) -> Result<()> {
+    fn initialize_self(&mut self, mempool: &BufferPoolHeader) -> Result<()> {
         self.buffer_id = unsafe {
             rio_vtable().RegisterBuffer(
-                mempool.chunk_start_ptr() as *mut i8,
-                mempool.chunk_pool_size() as u32,
+                mempool.pool_start_ptr().as_ptr() as *mut i8,
+                mempool.pool_size_bytes() as u32,
             )?
         };
         Ok(())
     }
-    fn initialize_buf(&self, mempool: &MemPoolHeader, buffer: &RawBufferRef) -> Self::Header {
+    fn initialize_header(&self, mempool: &BufferPoolHeader, buffer: &RawBufferRef) -> Self::Header {
         let rio_buffer_id = self.buffer_id;
         let data_rio_offset = buffer
             .data_ptr()
-            .wrapping_sub(mempool.chunk_start_ptr() as usize)
+            .as_ptr()
+            .wrapping_sub(mempool.pool_start_ptr().as_ptr() as usize)
             as ULONG;
         let mut header = Self::Header::default();
         header.data_rio_offset = data_rio_offset;

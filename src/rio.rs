@@ -4,7 +4,7 @@ use crate::buffer::{BufferRef, RawBufferRef};
 use crate::rio_buf::RIOPacketBuf;
 use crate::{Error, Result};
 use core::mem::{size_of, MaybeUninit};
-use core::ptr::null_mut;
+use core::ptr::{null_mut, NonNull};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::task::Waker;
@@ -419,7 +419,7 @@ impl RIOSocket {
                 null_mut(),
                 null_mut(),
                 RIO_MSG_DEFER,
-                packet.into_raw().into_raw() as PVOID,
+                packet.into_raw().into_raw().as_ptr() as PVOID,
             )?;
             state_guard.recv_slots_open -= 1;
             Ok(())
@@ -508,7 +508,7 @@ impl RIOSocket {
                 null_mut(),
                 null_mut(),
                 RIO_MSG_DEFER,
-                packet.into_raw().into_raw() as PVOID,
+                packet.into_raw().into_raw().as_ptr() as PVOID,
             )?;
             state_guard.send_slots_open -= 1;
             Ok(())
@@ -690,14 +690,14 @@ impl RIOQueue {
         for i in 0..num_completions {
             let rio_result = results_buffer.get_unchecked(i);
             let mut packet_buf = BufferRef::<T>::from_raw(RawBufferRef::from_raw(
-                rio_result.RequestContext as *mut u8,
+                NonNull::new_unchecked(rio_result.RequestContext as *mut u8),
             ));
             let result = if rio_result.Status == 0 {
                 Ok(())
             } else {
                 Err(Error::WSAErr("RIORESULT", rio_result.Status))
             };
-            let mut header_mut = AsMut::<RIOPacketBuf>::as_mut(packet_buf.user_header_mut());
+            let mut header_mut = packet_buf.header_mut::<RIOPacketBuf>();
             let op_type = header_mut.active_op;
             header_mut.active_op = RIOOpType::None;
             match op_type {

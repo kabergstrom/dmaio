@@ -1,6 +1,5 @@
-use crate::buffer::{BufferHandle, BufferRef};
+use crate::buffer::{BufferHandle, BufferHeaderInit, BufferPoolHeader, BufferRef};
 use crate::iocp::{IOCPHandler, IOCPQueueBuilder};
-use crate::mempool::CustomMemPool;
 use crate::rio::{RIOCompletion, RIOQueue, RIOSocket};
 use crate::rio_buf::{RIOPacketBuf, RIOPacketPool};
 use crate::Result;
@@ -57,21 +56,21 @@ pub struct IOPacketPool {
     rio_init: RIOPacketPool,
     waker_init: WakerContextInit,
 }
-impl CustomMemPool for IOPacketPool {
+impl BufferHeaderInit for IOPacketPool {
     type Header = IOPacketHeader;
-    fn initialize_self(&mut self, mempool: &crate::mempool::MemPoolHeader) -> Result<()> {
-        self.rio_init.initialize_self(mempool)?;
-        self.waker_init.initialize_self(mempool)?;
+    fn initialize_self(&mut self, bufpool: &BufferPoolHeader) -> Result<()> {
+        self.rio_init.initialize_self(bufpool)?;
+        self.waker_init.initialize_self(bufpool)?;
         Ok(())
     }
-    fn initialize_buf(
+    fn initialize_header(
         &self,
-        mempool: &crate::mempool::MemPoolHeader,
+        bufpool: &BufferPoolHeader,
         buffer: &crate::buffer::RawBufferRef,
     ) -> Self::Header {
         Self::Header {
-            rio: self.rio_init.initialize_buf(mempool, buffer),
-            waker: self.waker_init.initialize_buf(mempool, buffer),
+            rio: self.rio_init.initialize_header(bufpool, buffer),
+            waker: self.waker_init.initialize_header(bufpool, buffer),
         }
     }
 }
@@ -158,8 +157,8 @@ impl<T: AsMut<RIOPacketBuf> + AsMut<WakerContext>> IOCPHandler for RIOQueueHandl
             let rio_queue = RIOQueue::from_overlapped(&*entry.lpOverlapped);
             let num_completions = rio_queue.dequeue_completions(results_buf)?;
             for mut completion in results_buf.drain(0..num_completions) {
-                AsMut::<WakerContext>::as_mut(completion.packet_buf.user_header_mut())
-                    .complete_op(completion.result.clone());
+                let mut waker_header = completion.packet_buf.header_mut::<WakerContext>();
+                waker_header.complete_op(completion.result.clone());
                 // println!("finish op {:?}", completion.op_type);
                 drop(completion);
             }
@@ -200,14 +199,14 @@ impl<'a, T: AsMut<RIOPacketBuf> + AsMut<WakerContext> + 'static> NetContextBuild
 
 #[derive(Default)]
 struct WakerContextInit;
-impl CustomMemPool for WakerContextInit {
+impl BufferHeaderInit for WakerContextInit {
     type Header = WakerContext;
-    fn initialize_self(&mut self, mempool: &crate::mempool::MemPoolHeader) -> Result<()> {
+    fn initialize_self(&mut self, bufpool: &BufferPoolHeader) -> Result<()> {
         Ok(())
     }
-    fn initialize_buf(
+    fn initialize_header(
         &self,
-        mempool: &crate::mempool::MemPoolHeader,
+        bufpool: &BufferPoolHeader,
         buffer: &crate::buffer::RawBufferRef,
     ) -> Self::Header {
         WakerContext(Mutex::new(WakerContextInner {

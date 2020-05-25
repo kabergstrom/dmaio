@@ -12,28 +12,43 @@ use winapi::{
     um::{
         errhandlingapi::GetLastError,
         memoryapi, sysinfoapi,
-        winnt::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE},
+        winnt::{MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE},
     },
 };
 
-struct MemPoolVTable {}
-pub struct MemPoolHeader {
+struct BufferPoolVTable {}
+/// BufferPool's internal untyped header
+pub struct BufferPoolHeader {
+    /// count of references to the buffer pool (by allocated buffers and BufferPools)
     ref_count: AtomicUsize,
-    alloc_ptr: *mut u8,       // pointer to the start of the entire allocation
-    alloc_layout: Layout,     // layout of the entire allocation
-    chunk_start_ptr: *mut u8, // pointer to the start of the chunk pool
-    num_chunks: usize,        // number of chunks in the chunk pool
-    pool_layout: Layout,      // layout of the chunk pool
-    chunk_layout: Layout,     // layout of a chunk
-    data_layout: Layout,      // layout of the data segment of a chunk
-    header_layout: Layout,    // layout of the header segment of a chunk
-    free_chunks: Ring<*mut u8>,
-    free_func: unsafe fn(*mut u8, usize),
+    /// pointer to the start of the entire allocation
+    alloc_ptr: NonNull<u8>,
+    /// layout of the entire allocation
+    alloc_layout: Layout,
+    /// pointer to the start of the buffer pool
+    buffer_start_ptr: NonNull<u8>,
+    /// number of buffers in the buffer pool
+    num_buffers: usize,
+    /// layout of the buffer pool
+    pool_layout: Layout,
+    /// layout of a buffer
+    buffer_layout: Layout,
+    /// layout of the data segment of a buffer
+    buffer_data_layout: Layout,
+    /// layout of the header segment of a buffer
+    header_layout: Layout,
+    /// ring buffer of free buffers
+    free_buffers: Ring<NonNull<u8>>,
+    /// function used to free the buffer's memory when the buffer pool is dropped
+    free_func: unsafe fn(NonNull<u8>, usize),
+    /// list of wakers to wake when buffers are freed; they are added to this vec if no buffers are available on alloc
     pending_wakers: Mutex<Vec<Waker>>,
+    /// count of number of free buffers
     num_free_buffers: AtomicUsize,
-    buf_pool_ptr: MaybeUninit<*mut dyn BufferPool>,
+    /// fat pointer to the buffer pool's typed section, used to initialize and drop buffers
+    buf_pool_ptr: MaybeUninit<*mut dyn BufferPoolDyn>,
 }
-impl MemPoolHeader {
+impl BufferPoolHeader {
     pub(crate) fn free_bufref(&self, buffer: RawBufferRef) {
         unsafe {
             (*self.buf_pool_ptr.as_ptr())
@@ -42,80 +57,80 @@ impl MemPoolHeader {
                 .free(buffer);
         }
     }
-    pub fn chunk_pool_size(&self) -> usize {
+    pub fn pool_size_bytes(&self) -> usize {
         self.pool_layout.size()
     }
-    pub fn chunk_start_ptr(&self) -> *mut u8 {
-        self.chunk_start_ptr
+    pub fn pool_start_ptr(&self) -> NonNull<u8> {
+        self.buffer_start_ptr
     }
-    pub fn chunk_size(&self) -> usize {
-        self.chunk_layout.size()
+    pub fn buffer_size_bytes(&self) -> usize {
+        self.buffer_layout.size()
     }
     unsafe fn init_buffer_header(&self, buffer: &mut RawBufferRef) {
         core::ptr::write(
             buffer.buffer_header_mut(),
             BufferHeader {
-                data_capacity: self.data_layout.size() as u32,
-                allocation_size: self.chunk_layout.size() as u32,
+                data_capacity: self.buffer_data_layout.size() as u32,
                 header_size: self.header_layout.size() as u16,
                 data_size: 0,
                 data_start_offset: 0,
                 ref_count: AtomicUsize::new(1),
                 ref_lock: AtomicBool::new(true),
-                mempool: Some(NonNull::new_unchecked(
-                    self as *const MemPoolHeader as *mut MemPoolHeader,
+                bufpool: Some(NonNull::new_unchecked(
+                    self as *const BufferPoolHeader as *mut BufferPoolHeader,
                 )),
             },
         );
         self.ref_count.fetch_add(1, Ordering::Relaxed);
     }
 }
-pub(crate) unsafe fn decrement_refcount(mut ptr: NonNull<MemPoolHeader>) {
+pub(crate) unsafe fn decrement_refcount(mut ptr: NonNull<BufferPoolHeader>) {
     if ptr.as_ref().ref_count.fetch_sub(1, Ordering::Relaxed) == 1 {
         (*(*ptr.as_mut().buf_pool_ptr.as_ptr())).drop_self_in_place();
     }
 }
-pub(crate) struct MemPoolInner<T> {
-    header: MemPoolHeader,
+pub(crate) struct BufferPoolInner<T> {
+    header: BufferPoolHeader,
     initializer: T,
 }
-pub trait BufferInitializer {
-    fn initialize_self_dyn(&mut self, mempool: &MemPoolHeader) -> Result<()>;
-    unsafe fn initialize_buf_dyn(&self, mempool: &MemPoolHeader, buffer: &mut RawBufferRef);
+trait BufferInitializer {
+    fn initialize_self_dyn(&mut self, bufpool: &BufferPoolHeader) -> Result<()>;
+    unsafe fn initialize_buf_dyn(&self, bufpool: &BufferPoolHeader, buffer: &mut RawBufferRef);
 }
-impl<T: CustomMemPool> BufferInitializer for T {
-    fn initialize_self_dyn(&mut self, mempool: &MemPoolHeader) -> Result<()> {
-        <T as CustomMemPool>::initialize_self(self, mempool)
+impl<T: BufferHeaderInit> BufferInitializer for T {
+    fn initialize_self_dyn(&mut self, bufpool: &BufferPoolHeader) -> Result<()> {
+        <T as BufferHeaderInit>::initialize_self(self, bufpool)
     }
-    unsafe fn initialize_buf_dyn(&self, mempool: &MemPoolHeader, buffer: &mut RawBufferRef) {
-        let header_ptr = buffer.header_ptr() as *mut <T as CustomMemPool>::Header;
+    unsafe fn initialize_buf_dyn(&self, bufpool: &BufferPoolHeader, buffer: &mut RawBufferRef) {
+        let header_ptr = buffer.header_ptr() as *mut <T as BufferHeaderInit>::Header;
         std::ptr::write(
             header_ptr,
-            <T as CustomMemPool>::initialize_buf(self, mempool, &buffer),
+            <T as BufferHeaderInit>::initialize_header(self, bufpool, &buffer),
         );
     }
 }
-pub trait CustomMemPool: BufferInitializer {
+/// The `BufferHeaderInit` trait allows for users to implement initialization of custom buffer headers in a `BufferPool`.
+pub trait BufferHeaderInit {
     type Header;
-    fn initialize_self(&mut self, mempool: &MemPoolHeader) -> Result<()>;
-    fn initialize_buf(&self, mempool: &MemPoolHeader, buffer: &RawBufferRef) -> Self::Header;
+    fn initialize_self(&mut self, bufpool: &BufferPoolHeader) -> Result<()>;
+    fn initialize_header(&self, bufpool: &BufferPoolHeader, buffer: &RawBufferRef) -> Self::Header;
 }
-impl CustomMemPool for () {
+impl BufferHeaderInit for () {
     type Header = ();
-    fn initialize_self(&mut self, mempool: &MemPoolHeader) -> Result<()> {
+    fn initialize_self(&mut self, bufpool: &BufferPoolHeader) -> Result<()> {
         Ok(())
     }
-    fn initialize_buf(&self, mempool: &MemPoolHeader, buffer: &RawBufferRef) -> Self::Header {
+    fn initialize_header(&self, bufpool: &BufferPoolHeader, buffer: &RawBufferRef) -> Self::Header {
         ()
     }
 }
 // this trait exists so that the alloc/free interface can be free from type parameters
-pub trait BufferPool {
+pub(crate) trait BufferPoolDyn {
     fn alloc_initialized(&self, waker: Option<&Waker>) -> Option<RawBufferRef>;
     fn free(&self, buffer: RawBufferRef);
     unsafe fn drop_self_in_place(&mut self);
 }
-impl<T> Drop for MemPoolInner<T> {
+impl<T> Drop for BufferPoolInner<T> {
     fn drop(&mut self) {
         unsafe {
             let free_func = self.header.free_func;
@@ -125,30 +140,35 @@ impl<T> Drop for MemPoolInner<T> {
         }
     }
 }
-impl<T: CustomMemPool> BufferPool for MemPoolInner<T> {
+impl<T: BufferHeaderInit> BufferPoolDyn for BufferPoolInner<T> {
     fn alloc_initialized(&self, waker: Option<&Waker>) -> Option<RawBufferRef> {
         unsafe {
             if let Some(mut buffer_ref) = self
                 .header
-                .free_chunks
+                .free_buffers
                 .pop_single()
                 .map(|ptr| RawBufferRef::from_raw(ptr))
             {
                 self.header.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
                 self.header.init_buffer_header(&mut buffer_ref);
-                debug_assert!(buffer_ref.data_ptr() > self.header.chunk_start_ptr());
+                debug_assert!(buffer_ref.data_ptr() > self.header.pool_start_ptr());
                 debug_assert!(
-                    buffer_ref.data_ptr().add(
+                    buffer_ref.data_ptr().as_ptr().add(
                         buffer_ref.buffer_header().data_start_offset() as usize
                             + buffer_ref.buffer_header().data_size() as usize
-                    ) <= self.header.alloc_ptr.add(self.header.alloc_layout.size())
+                    ) <= self
+                        .header
+                        .alloc_ptr
+                        .as_ptr()
+                        .add(self.header.alloc_layout.size())
                 );
                 debug_assert!(
-                    buffer_ref.header_ptr() >= self.header.chunk_start_ptr
+                    buffer_ref.header_ptr() >= self.header.buffer_start_ptr.as_ptr()
                         && buffer_ref.header_ptr()
                             < self
                                 .header
-                                .chunk_start_ptr
+                                .buffer_start_ptr
+                                .as_ptr()
                                 .add(self.header.alloc_layout.size())
                 );
                 self.initializer
@@ -161,8 +181,8 @@ impl<T: CustomMemPool> BufferPool for MemPoolInner<T> {
     }
     fn free(&self, buffer: RawBufferRef) {
         unsafe {
-            core::ptr::drop_in_place(buffer.header_ptr() as *mut <T as CustomMemPool>::Header);
-            if let Some(buffer) = self.header.free_chunks.push(buffer.into_raw()) {
+            core::ptr::drop_in_place(buffer.header_ptr() as *mut <T as BufferHeaderInit>::Header);
+            if let Some(buffer) = self.header.free_buffers.push(buffer.into_raw()) {
                 core::mem::forget(buffer);
                 panic!("buffer free exceeded internal pool capacity");
             } else {
@@ -181,142 +201,149 @@ impl<T: CustomMemPool> BufferPool for MemPoolInner<T> {
         core::ptr::drop_in_place(self);
     }
 }
-pub struct MemPool<T>(*mut MemPoolInner<T>, core::marker::PhantomData<T>);
-unsafe impl<T> Send for MemPool<T> {}
-unsafe impl<T> Sync for MemPool<T> {}
-impl<T> MemPool<T> {
-    pub(crate) fn inner(&self) -> &MemPoolInner<T> {
+/// A fixed-size pool of fixed-size buffers
+pub struct BufferPool<T>(*mut BufferPoolInner<T>, core::marker::PhantomData<T>);
+unsafe impl<T> Send for BufferPool<T> {}
+unsafe impl<T> Sync for BufferPool<T> {}
+impl<T> BufferPool<T> {
+    pub(crate) fn inner(&self) -> &BufferPoolInner<T> {
         unsafe { &*self.0 }
     }
 }
-impl<T> Clone for MemPool<T> {
+impl<T> Clone for BufferPool<T> {
     fn clone(&self) -> Self {
         self.inner()
             .header
             .ref_count
             .fetch_add(1, Ordering::Relaxed);
-        MemPool(self.0, self.1)
+        BufferPool(self.0, self.1)
     }
 }
-impl<T: CustomMemPool + 'static + Send + Sync> MemPool<T> {
+impl<T: BufferHeaderInit + 'static + Send + Sync> BufferPool<T> {
+    /// Gets a reference to the user-provided `BufferHeaderInit`
     pub fn initializer(&self) -> &T {
         &self.inner().initializer
     }
+    /// Creates a new buffer pool
     pub unsafe fn new(
-        num_elements: usize,
-        element_layout: Layout,
+        num_buffers: usize,
+        data_segment_layout: Layout,
         alloc_func: unsafe fn(usize) -> Result<*mut u8>,
-        free_func: unsafe fn(*mut u8, usize),
+        free_func: unsafe fn(NonNull<u8>, usize),
         initializer: T,
     ) -> Result<Self> {
         let page_size = page_size();
         let buffer_header_layout = Layout::new::<BufferHeader>();
-        // calculate the layout for a single chunk
-        let (chunk_layout, element_offset, header_layout) = {
-            let user_header = Layout::new::<<T as CustomMemPool>::Header>();
+        // calculate the layout for a single buffer
+        let (buffer_layout, data_segment_offset, header_layout) = {
+            let user_header = Layout::new::<<T as BufferHeaderInit>::Header>();
             let header_size = user_header.size() + buffer_header_layout.size();
             let header_layout = Layout::from_size_align(header_size, user_header.align())?;
-            let (chunk_layout, element_offset) = header_layout.extend(element_layout)?;
-            (chunk_layout.pad_to_align(), element_offset, header_layout)
+            let (buffer_layout, data_segment_offset) = header_layout.extend(data_segment_layout)?;
+            (
+                buffer_layout.pad_to_align(),
+                data_segment_offset,
+                header_layout,
+            )
         };
-        debug_assert!(chunk_layout.size() < 1 << 32);
-        debug_assert!(element_offset < core::u16::MAX as usize);
+        debug_assert!(buffer_layout.size() < 1 << 32);
+        debug_assert!(data_segment_offset < core::u16::MAX as usize);
 
-        // calculate the layout for `num_elements` chunks
-        let (pool_layout, chunk_size) = layout_repeat(&chunk_layout, num_elements)?;
+        // calculate the layout for `num_buffers` buffers
+        let (pool_layout, buffer_size) = layout_repeat(&buffer_layout, num_buffers)?;
         let pool_layout = pool_layout.align_to(page_size)?;
-        let mempool_header_layout = Layout::new::<MemPoolInner<T>>();
-        let (alloc_layout, pool_start_offset) = mempool_header_layout.extend(pool_layout)?;
+        let bufpool_header_layout = Layout::new::<BufferPoolInner<T>>();
+        let (alloc_layout, pool_start_offset) = bufpool_header_layout.extend(pool_layout)?;
         // pad the end with a pointer, because the windows RIO buffer registration checks are off by one :)
-        let (alloc_layout, _) = alloc_layout.extend(Layout::new::<usize>())?;
-        let mempool_ptr = alloc_func(alloc_layout.size())?;
-        let chunk_start_ptr = mempool_ptr.add(pool_start_offset);
-        debug_assert!(chunk_start_ptr as usize % pool_layout.align() == 0);
-        debug_assert!(mempool_ptr as usize % pool_layout.align() == 0);
+        let (alloc_layout, _) = alloc_layout
+            .extend(Layout::from_size_align(large_page_minimum(), large_page_minimum()).unwrap())?;
+        let bufpool_ptr = alloc_func(alloc_layout.size())?;
+        let buffer_start_ptr = bufpool_ptr.add(pool_start_offset);
+        debug_assert!(buffer_start_ptr as usize % pool_layout.align() == 0);
+        debug_assert!(bufpool_ptr as usize % pool_layout.align() == 0);
         core::ptr::write(
-            mempool_ptr as *mut MemPoolInner<T>,
-            MemPoolInner {
-                header: MemPoolHeader {
+            bufpool_ptr as *mut BufferPoolInner<T>,
+            BufferPoolInner {
+                header: BufferPoolHeader {
                     ref_count: AtomicUsize::new(1),
-                    alloc_ptr: mempool_ptr,
-                    num_chunks: num_elements,
-                    chunk_start_ptr,
+                    alloc_ptr: NonNull::new_unchecked(bufpool_ptr),
+                    num_buffers,
+                    buffer_start_ptr: NonNull::new_unchecked(buffer_start_ptr),
                     alloc_layout,
-                    data_layout: element_layout,
+                    buffer_data_layout: data_segment_layout,
                     header_layout,
                     pool_layout,
-                    chunk_layout,
-                    num_free_buffers: AtomicUsize::new(num_elements),
+                    buffer_layout,
+                    num_free_buffers: AtomicUsize::new(num_buffers),
                     pending_wakers: Mutex::new(Vec::new()),
                     free_func,
-                    free_chunks: Ring::new(num_elements + 1),
+                    free_buffers: Ring::new(num_buffers + 1),
                     buf_pool_ptr: MaybeUninit::zeroed(),
                 },
                 initializer,
             },
         );
-        let mut mempool = &mut *(mempool_ptr as *mut MemPoolInner<T>);
-        *mempool.header.buf_pool_ptr.as_mut_ptr() = mempool_ptr as *mut MemPoolInner<T>;
+        let mut bufpool = &mut *(bufpool_ptr as *mut BufferPoolInner<T>);
+        *bufpool.header.buf_pool_ptr.as_mut_ptr() = bufpool_ptr as *mut BufferPoolInner<T>;
 
-        for i in 0..num_elements {
-            debug_assert!(i * chunk_size < pool_layout.size());
-            let chunk_ptr = chunk_start_ptr.add(i * chunk_size);
-            let data_ptr = chunk_ptr.add(element_offset);
+        for i in 0..num_buffers {
+            debug_assert!(i * buffer_size < pool_layout.size());
+            let buffer_ptr = buffer_start_ptr.add(i * buffer_size);
+            let data_ptr = buffer_ptr.add(data_segment_offset);
             let header_ptr = data_ptr.sub(buffer_header_layout.size());
-            debug_assert!(header_ptr >= chunk_start_ptr);
+            debug_assert!(header_ptr >= buffer_start_ptr);
             debug_assert!(
                 header_ptr.add(buffer_header_layout.size())
-                    < chunk_start_ptr.add(pool_layout.size())
+                    < buffer_start_ptr.add(pool_layout.size())
             );
             debug_assert!(
-                data_ptr.add(element_layout.size()) <= mempool_ptr.add(alloc_layout.size())
+                data_ptr.add(data_segment_layout.size()) <= bufpool_ptr.add(alloc_layout.size())
             );
             debug_assert!(
-                data_ptr.add(element_layout.size()) <= chunk_start_ptr.add(pool_layout.size())
+                data_ptr.add(data_segment_layout.size())
+                    <= buffer_start_ptr.add(pool_layout.size())
             );
-            mempool.header.free_chunks.push(data_ptr);
+            bufpool
+                .header
+                .free_buffers
+                .push(NonNull::new_unchecked(data_ptr));
         }
-        mempool.initializer.initialize_self(&mempool.header)?;
-        Ok(MemPool(
-            mempool_ptr as *mut MemPoolInner<T>,
+        bufpool.initializer.initialize_self(&bufpool.header)?;
+        Ok(BufferPool(
+            bufpool_ptr as *mut BufferPoolInner<T>,
             core::marker::PhantomData,
         ))
     }
-    // pub unsafe fn free_raw(&self, ptr: *mut u8) {
-    //     self.header().free_chunks.push(ptr);
-    // }
-    // pub unsafe fn alloc_raw(&self) -> Option<(*mut u8, usize)> {
-    //     if let Some(buf) = self.header().free_chunks.pop_single() {
-    //         Some((buf, self.chunk_size()))
-    //     } else {
-    //         None
-    //     }
-    // }
-    pub fn alloc(&self) -> impl Future<Output = BufferRef<<T as CustomMemPool>::Header>> + Send {
+    /// Allocates a buffer. The returned future will return `Poll::Pending` if there are no available buffers,
+    /// and will be woken when buffers become available.
+    pub fn alloc(&self) -> impl Future<Output = BufferRef<<T as BufferHeaderInit>::Header>> + Send {
         AllocFuture {
-            mempool: self.clone(),
+            bufpool: self.clone(),
         }
     }
-    pub fn chunk_pool_size(&self) -> usize {
+    /// Returns the size of the allocation containing buffers
+    pub fn pool_size_bytes(&self) -> usize {
         self.inner().header.pool_layout.size()
     }
-    pub fn chunk_start_ptr(&self) -> *mut u8 {
-        self.inner().header.chunk_start_ptr
+    /// Returns a pointer to the start of the allocation containing buffers
+    pub fn pool_start_ptr(&self) -> NonNull<u8> {
+        self.inner().header.buffer_start_ptr
     }
-    pub fn chunk_size(&self) -> usize {
-        self.inner().header.chunk_layout.size()
+    /// Returns the size of buffers allocated by this buffer pool in bytes
+    pub fn buffer_size_bytes(&self) -> usize {
+        self.inner().header.buffer_layout.size()
     }
 }
-pub fn default<T: CustomMemPool + Send + Sync + 'static>(
+pub fn default_pool<T: BufferHeaderInit + Send + Sync + 'static>(
     pool_size: usize,
     buffer_size: Layout,
     initializer: T,
-) -> Result<MemPool<T>> {
+) -> Result<BufferPool<T>> {
     unsafe {
-        let free_func = |ptr, size| {
-            crate::mempool::virtual_free(ptr, size).unwrap();
+        let free_func = |ptr: NonNull<u8>, size| {
+            virtual_free(ptr.as_ptr(), size).unwrap();
         };
-        MemPool::new(
+        BufferPool::new(
             pool_size,
             buffer_size,
             virtual_alloc,
@@ -325,7 +352,7 @@ pub fn default<T: CustomMemPool + Send + Sync + 'static>(
         )
     }
 }
-impl<T> Drop for MemPool<T> {
+impl<T> Drop for BufferPool<T> {
     fn drop(&mut self) {
         unsafe {
             decrement_refcount(NonNull::new_unchecked(&mut (*self.0).header));
@@ -334,17 +361,17 @@ impl<T> Drop for MemPool<T> {
 }
 
 struct AllocFuture<T> {
-    mempool: MemPool<T>,
+    bufpool: BufferPool<T>,
 }
-impl<T: CustomMemPool> Future for AllocFuture<T> {
-    type Output = BufferRef<<T as CustomMemPool>::Header>;
+impl<T: BufferHeaderInit> Future for AllocFuture<T> {
+    type Output = BufferRef<<T as BufferHeaderInit>::Header>;
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match self.mempool.inner().alloc_initialized(Some(cx.waker())) {
+        match self.bufpool.inner().alloc_initialized(Some(cx.waker())) {
             Some(buffer) => std::task::Poll::Ready(unsafe {
-                BufferRef::<<T as CustomMemPool>::Header>::from_raw(buffer)
+                BufferRef::<<T as BufferHeaderInit>::Header>::from_raw(buffer)
             }),
             None => {
                 println!("failed to alloc");
@@ -358,7 +385,7 @@ pub unsafe fn virtual_alloc(size: usize) -> Result<*mut u8> {
     let buffer = memoryapi::VirtualAlloc(
         null_mut(),
         size,
-        MEM_RESERVE | MEM_COMMIT, //| MEM_LARGE_PAGES,
+        MEM_RESERVE | MEM_COMMIT, // | MEM_LARGE_PAGES,
         PAGE_READWRITE,
     ) as *mut u8;
     if buffer == null_mut() {
@@ -389,12 +416,12 @@ pub unsafe fn page_size() -> usize {
     sysinfoapi::GetSystemInfo(&mut info as *mut _);
     info.dwPageSize as usize
 }
-pub unsafe fn allocation_granularity(size: usize) -> usize {
+pub unsafe fn allocation_granularity() -> usize {
     let mut info = sysinfoapi::SYSTEM_INFO::default();
     sysinfoapi::GetSystemInfo(&mut info as *mut _);
     info.dwAllocationGranularity as usize
 }
-pub unsafe fn large_page_minimum(size: usize) -> usize {
+pub unsafe fn large_page_minimum() -> usize {
     memoryapi::GetLargePageMinimum()
 }
 fn layout_padding_needed_for(layout: &Layout, align: usize) -> usize {
