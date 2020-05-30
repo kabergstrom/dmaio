@@ -537,8 +537,7 @@ impl RIOSocket {
                 remote_addr_param,
                 null_mut(),
                 null_mut(),
-                // RIO_MSG_DEFER,
-                0,
+                RIO_MSG_DEFER,
                 packet.into_raw().into_raw().as_ptr() as PVOID,
             )?;
             Self::notify(self.0.send_cq.cq());

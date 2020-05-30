@@ -131,7 +131,7 @@ impl<T: AsMut<RIOPacketBuf> + AsRef<WakerContext>> UdpSocket<T> {
         packet_buf.header::<WakerContext>().start_op(None);
         let buf_handle = packet_buf.make_handle();
         self.rio_socket.send_ex(packet_buf, None)?; // TODO push the result into the buffer ref, and immediately return
-                                                    // self.rio_socket.commit_send_ex().unwrap();
+        self.rio_socket.commit_send_ex().unwrap();
         Ok(BufferFuture { buf_handle })
     }
     pub fn receive(&self) -> impl AsyncBufferRead<T> {
