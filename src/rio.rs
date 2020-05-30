@@ -540,7 +540,6 @@ impl RIOSocket {
                 RIO_MSG_DEFER,
                 packet.into_raw().into_raw().as_ptr() as PVOID,
             )?;
-            Self::notify(self.0.send_cq.cq());
 
             state_guard.send_slots_open -= 1;
             Ok(())
