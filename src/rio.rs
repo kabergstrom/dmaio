@@ -362,6 +362,7 @@ impl RIOSocket {
             Ok(()) => {}
         }
 
+        // creating a rio socket has to lock the CQ
         match unsafe {
             create_rio_socket(
                 _type,
@@ -394,10 +395,18 @@ impl RIOSocket {
             }))),
         }
     }
-    pub fn receive_ex<T: AsMut<RIOPacketBuf>>(&self, mut packet: BufferRef<T>) -> Result<()> {
+
+    pub fn receive_ex<T: AsMut<RIOPacketBuf>>(
+        &self,
+        mut packet: BufferRef<T>,
+        waker: Option<&Waker>,
+    ) -> (Result<()>, Option<BufferRef<T>>) {
         let mut state_guard = self.0.state.lock();
         if state_guard.recv_slots_open == 0 {
-            return Err(Error::SlotsExhausted);
+            if let Some(waker) = waker {
+                state_guard.pending_recv_wakers.push(waker.clone());
+            }
+            return (Err(Error::SlotsExhausted), Some(packet));
         }
         unsafe {
             // println!("start op {:?}", RIOOpType::Receive);
@@ -410,7 +419,8 @@ impl RIOSocket {
             let remote_addr_param = &mut remote_addr_buf as PRIO_BUF;
             header.active_op = RIOOpType::Receive;
             header.op_socket = Some(self.clone());
-            rio_vtable().ReceiveEx(
+            let packet_ptr = packet.into_raw().into_raw().as_ptr();
+            if let Err(err) = rio_vtable().ReceiveEx(
                 self.0.rq,
                 &mut data_buf as PRIO_BUF,
                 1,
@@ -419,10 +429,17 @@ impl RIOSocket {
                 null_mut(),
                 null_mut(),
                 RIO_MSG_DEFER,
-                packet.into_raw().into_raw().as_ptr() as PVOID,
-            )?;
+                packet_ptr as PVOID,
+            ) {
+                return (
+                    Err(err),
+                    Some(BufferRef::from_raw(RawBufferRef::from_raw(
+                        NonNull::new_unchecked(packet_ptr),
+                    ))),
+                );
+            }
             state_guard.recv_slots_open -= 1;
-            Ok(())
+            (Ok(()), None)
         }
     }
     pub fn commit_receive_ex(&self) -> Result<()> {
@@ -438,9 +455,14 @@ impl RIOSocket {
                 RIO_MSG_COMMIT_ONLY,
                 null_mut(),
             )?;
-            rio_vtable().Notify(self.0.send_cq.cq())?;
+            Self::notify(self.0.receive_cq.cq());
         }
         Ok(())
+    }
+    fn notify(cq: RIO_CQ) {
+        unsafe {
+            rio_vtable().Notify(cq);
+        }
     }
     pub fn commit_send_ex(&self) -> Result<()> {
         unsafe {
@@ -455,7 +477,7 @@ impl RIOSocket {
                 RIO_MSG_COMMIT_ONLY,
                 null_mut(),
             )?;
-            rio_vtable().Notify(self.0.send_cq.cq())?;
+            Self::notify(self.0.send_cq.cq());
         }
         Ok(())
     }
@@ -473,9 +495,17 @@ impl RIOSocket {
             waker.wake();
         }
     }
-    pub fn send_ex<T: AsMut<RIOPacketBuf>>(&self, mut packet: BufferRef<T>) -> Result<()> {
+    pub fn send_ex<T: AsMut<RIOPacketBuf>>(
+        &self,
+        mut packet: BufferRef<T>,
+        waker: Option<&Waker>,
+    ) -> Result<()> {
         let mut state_guard = self.0.state.lock();
         if state_guard.send_slots_open == 0 {
+            if let Some(waker) = waker {
+                state_guard.pending_send_wakers.push(waker.clone());
+            }
+            println!("send exhausted");
             return Err(Error::SlotsExhausted);
         }
         unsafe {
@@ -498,7 +528,7 @@ impl RIOSocket {
             debug_assert!(data_buf.Length > 0);
             debug_assert!(data_buf.BufferId != RIO_INVALID_BUFFERID);
             header.active_op = RIOOpType::Send;
-            // println!("start op {:?}", RIOOpType::Send);
+            // println!("start op {:?} {:?}", RIOOpType::Send, self.0.socket);
             rio_vtable().SendEx(
                 self.0.rq,
                 &mut data_buf as PRIO_BUF,
@@ -507,9 +537,12 @@ impl RIOSocket {
                 remote_addr_param,
                 null_mut(),
                 null_mut(),
-                RIO_MSG_DEFER,
+                // RIO_MSG_DEFER,
+                0,
                 packet.into_raw().into_raw().as_ptr() as PVOID,
             )?;
+            Self::notify(self.0.send_cq.cq());
+
             state_guard.send_slots_open -= 1;
             Ok(())
         }
@@ -552,6 +585,12 @@ impl RIOSocket {
     }
     pub fn bind(&self, addr: std::net::SocketAddr) -> Result<()> {
         unsafe { bind_socket(self, addr) }
+    }
+    pub fn total_recv_slots(&self) -> u32 {
+        self.0.total_recv_slots
+    }
+    pub fn total_send_slots(&self) -> u32 {
+        self.0.total_recv_slots
     }
 }
 unsafe fn create_rio_socket(

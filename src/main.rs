@@ -19,6 +19,7 @@ use crate::net_api::{
     IOPacketHeader, IOPacketPool, NetContext, NetContextBuilder, UdpSocket, UdpSocketBuilder,
 };
 use crate::rio_buf::RIOPacketBuf;
+use futures_core::stream::Stream;
 
 use alloc::alloc::Layout;
 use alloc::sync::Arc;
@@ -69,53 +70,84 @@ unsafe fn create_completion_port(max_thread_users: u32) -> Result<HANDLE> {
         Err(Error::CreateCompletionPortFailed)
     }
 }
-const PACKET_SIZE: u32 = 16000;
-const SEND_OPS_IN_FLIGHT: u32 = 24;
-const RECV_OPS_IN_FLIGHT: u32 = 24;
-const SOCKET_BUF_SIZE: u32 = SEND_OPS_IN_FLIGHT * PACKET_SIZE * 1;
+const PACKET_SIZE: u32 = 64;
+const SEND_OPS_IN_FLIGHT: u32 = 16;
+const RECV_OPS_IN_FLIGHT: u32 = 16;
+const SOCKET_BUF_SIZE: u32 = SEND_OPS_IN_FLIGHT * PACKET_SIZE * 16;
 const PACKETS_TO_SEND: usize = 100_000;
 
 async fn recv_loop(
-    packet_pool: buffer::BufferPool<IOPacketPool>,
     net_context: NetContext<IOPacketHeader>,
     server_addr: std::net::SocketAddr,
 ) -> Result<()> {
     println!("start recv loop");
-    let server_socket = UdpSocketBuilder::new().build(&net_context)?;
+    let server_socket = UdpSocketBuilder::new()
+        .concurrent_sends(SEND_OPS_IN_FLIGHT)
+        .concurrent_receives(RECV_OPS_IN_FLIGHT)
+        .build(&net_context)?;
     server_socket.bind(server_addr)?;
     let mut packets_received = 0;
+    use net_api::AsyncBufferReadExt;
+    let mut packets = Vec::new();
+    let mut recv_stream = server_socket.receive();
+    let mut sends = Vec::new();
     loop {
-        let recv_packet = packet_pool.alloc().await;
-        let recv1 = server_socket.receive(recv_packet);
-        let (recv_packet, result) = recv1.await;
-        result?;
-        packets_received += 1;
-        if packets_received % 10000 == 0 {
+        let num_new_packets = recv_stream.read(&mut packets).await?;
+        let len = packets.len();
+        for mut recv_packet in packets.drain(0..len) {
+            let mut header = recv_packet.header_mut::<RIOPacketBuf>();
+            header.set_local_addr(None);
+            // use std::io::Read;
+            // let mut buf = Vec::new();
+
+            // recv_packet.reader().read_to_end(&mut buf).unwrap();
+            sends.push(server_socket.send(recv_packet)?);
+            // result?;
+        }
+        let len = sends.len();
+        for send in sends.drain(0..len) {
+            send.await?;
+        }
+        packets_received += num_new_packets;
+        if packets_received % 100000 == 0 {
             println!("received {}", packets_received);
         }
     }
 }
 async fn send_loop(
-    packet_pool: buffer::BufferPool<IOPacketPool>,
     net_context: NetContext<IOPacketHeader>,
     server_addr: std::net::SocketAddr,
     client_addr: std::net::SocketAddr,
 ) -> Result<()> {
     println!("start send loop");
-    let client_socket = UdpSocketBuilder::new().build(&net_context)?;
+    let client_socket = UdpSocketBuilder::new()
+        .concurrent_sends(SEND_OPS_IN_FLIGHT)
+        .concurrent_receives(RECV_OPS_IN_FLIGHT)
+        .build(&net_context)?;
     client_socket.bind(client_addr)?;
     let mut packets_sent = 0;
+    let mut recv_stream = client_socket.receive();
+    let mut packets = Vec::new();
+    use net_api::AsyncBufferReadExt;
+    let mut sends = Vec::new();
     loop {
-        let mut send_packet = packet_pool.alloc().await;
-        use std::io::Write;
-        send_packet.write(&[5u8; PACKET_SIZE as usize]); // write data to packet
-        send_packet
-            .header_mut::<RIOPacketBuf>()
-            .set_remote_addr(Some(server_addr)); // set remote address of the send op
-        let (send_packet, result) = client_socket.send(send_packet).await;
-        result?;
+        for i in 0..SEND_OPS_IN_FLIGHT {
+            let mut send_packet = net_context.alloc_buffer().await;
+            use std::io::Write;
+            send_packet.write(&[5u8; PACKET_SIZE as usize]); // write data to packet
+            send_packet
+                .header_mut::<RIOPacketBuf>()
+                .set_remote_addr(Some(server_addr)); // set remote address of the send op
+            sends.push(client_socket.send(send_packet)?);
+        }
+        let len = sends.len();
+        for send in sends.drain(0..len) {
+            send.await?;
+        }
+        let num_new_packets = recv_stream.read(&mut packets).await?;
+        packets.clear();
         packets_sent += 1;
-        if packets_sent % 10000 == 0 {
+        if packets_sent % 100000 == 0 {
             println!("sent {}", packets_sent);
         }
     }
@@ -127,45 +159,66 @@ fn main() -> Result<()> {
         rio::wsa_init()?;
         rio::init_rio()?;
     }
+    let num_threads = 16;
+    let mut iocp_queues = Vec::new();
+    let num_receivers = 4;
     let packet_pool = buffer::default_pool(
-        1024,
+        RECV_OPS_IN_FLIGHT as usize
+            + SEND_OPS_IN_FLIGHT as usize * num_threads * num_receivers * 2 as usize,
         Layout::from_size_align(PACKET_SIZE as usize, 4096).unwrap(),
         IOPacketPool::default(),
     )?;
-    let mut iocp_builder = IOCPQueueBuilder::new(1)?;
-    let net_context = NetContextBuilder::<IOPacketHeader>::new(&mut iocp_builder).finish()?;
+    for j in 0..num_receivers {
+        let packet_pool = packet_pool.clone();
+        let server_addr = format!("127.0.0.1:351{}", j).parse().unwrap();
+        let mut iocp_builder = IOCPQueueBuilder::new(1)?;
+        let net_context =
+            NetContextBuilder::<IOPacketHeader>::new(&mut iocp_builder, packet_pool.clone())
+                .finish()?;
+        let mut iocp = iocp_builder.build()?;
+        let spawn_handle = iocp.handle();
+        spawn_handle.spawn(async move {
+            recv_loop(net_context, server_addr).await.unwrap();
+            println!("recv loop died");
+        });
+        iocp_queues.push(iocp);
+    }
 
-    let mut iocp = iocp_builder.build()?;
-    iocp.poll(Some(0));
-    let spawn_handle = iocp.handle();
-    let ret_val = spawn_handle.spawn(async {
-        println!("hi");
-        5
-    });
-    let server_addr = "127.0.0.1:3512".parse().unwrap();
-    let client_addr = "127.0.0.1:3513".parse().unwrap();
-    spawn_handle.spawn(async move { println!("done {:?}", ret_val.await) });
-    let recv_packet_pool = packet_pool.clone();
-    let recv_context = net_context.clone();
-    spawn_handle.spawn(async move {
-        recv_loop(recv_packet_pool, recv_context, server_addr)
-            .await
-            .unwrap();
-        println!("recv loop died");
-    });
-    let send_packet_pool = packet_pool.clone();
-    let send_net_context = net_context.clone();
-    spawn_handle.spawn(async move {
-        send_loop(send_packet_pool, send_net_context, server_addr, client_addr)
-            .await
-            .unwrap();
-        println!("send loop died");
-    });
-    loop {
-        if iocp.poll(Some(10)).unwrap() {
-            println!("POKE");
-            net_context.poke();
+    for i in 0..(num_threads - num_receivers) {
+        let packet_pool = packet_pool.clone();
+        let mut iocp_builder = IOCPQueueBuilder::new(1)?;
+        let send_net_context =
+            NetContextBuilder::<IOPacketHeader>::new(&mut iocp_builder, packet_pool.clone())
+                .finish()?;
+        let mut iocp = iocp_builder.build()?;
+        let spawn_handle = iocp.handle();
+        for j in 0..num_receivers {
+            let send_net_context = send_net_context.clone();
+            let client_addr = format!("127.0.0.1:36{}{}", i, j).parse().unwrap();
+            let server_addr = format!("127.0.0.1:351{}", j).parse().unwrap();
+            spawn_handle.spawn(async move {
+                send_loop(send_net_context, server_addr, client_addr)
+                    .await
+                    .unwrap();
+                println!("send loop died");
+            });
         }
+        iocp_queues.push(iocp);
+    }
+
+    let mut threads = Vec::new();
+    for mut iocp in iocp_queues {
+        threads.push(std::thread::spawn(move || -> Result<()> {
+            loop {
+                if iocp.poll(Some(10)).unwrap() {
+                    // net_context.poke().unwrap();
+                }
+            }
+            Ok(())
+        }));
+    }
+    for thread in threads {
+        thread.join().unwrap();
     }
 
     Ok(())
@@ -383,3 +436,46 @@ fn main() -> Result<()> {
 //     }
 //     Ok(())
 // }
+
+impl<T: ?Sized> StreamExt for T where T: Stream {}
+trait StreamExt: Stream {
+    fn next(&mut self) -> Next<'_, Self>
+    where
+        Self: Unpin,
+    {
+        Next::new(self)
+    }
+}
+/// Future for the [`next`](super::StreamExt::next) method.
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Next<'a, St: ?Sized> {
+    stream: &'a mut St,
+}
+
+impl<St: ?Sized + Unpin> Unpin for Next<'_, St> {}
+
+impl<'a, St: ?Sized + Stream + Unpin> Next<'a, St> {
+    fn new(stream: &'a mut St) -> Self {
+        Next { stream }
+    }
+}
+
+impl<St: ?Sized + futures_core::stream::FusedStream + Unpin> futures_core::future::FusedFuture
+    for Next<'_, St>
+{
+    fn is_terminated(&self) -> bool {
+        self.stream.is_terminated()
+    }
+}
+
+impl<St: ?Sized + Stream + Unpin> std::future::Future for Next<'_, St> {
+    type Output = Option<St::Item>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.stream).poll_next(cx)
+    }
+}

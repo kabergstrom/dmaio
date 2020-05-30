@@ -9,7 +9,7 @@ use crate::alloc::{
 };
 use crate::Result;
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
+use core::ptr::{null_mut, NonNull};
 
 /// Typed reference to a buffer and its header. Does not offer access to its contents.
 pub struct BufferHandle<T> {
@@ -17,6 +17,7 @@ pub struct BufferHandle<T> {
     pub(super) marker: core::marker::PhantomData<T>,
 }
 /// Typed reference to a buffer and its header. Does not offer access to its contents.
+#[derive(Debug)]
 pub struct RawBufferHandle {
     /// pointer to the buffer's data segment
     ptr: NonNull<u8>,
@@ -30,10 +31,14 @@ impl Clone for RawBufferHandle {
 }
 impl RawBufferHandle {
     /// Upgrades the `RawBufferHandle` into a `RawBufferRef` if there are no other references with exclusive access.
-    pub fn try_upgrade(mut self) -> core::result::Result<RawBufferRef, Self> {
+    pub fn try_upgrade(
+        mut self,
+        waker: Option<&core::task::Waker>,
+    ) -> core::result::Result<RawBufferRef, Self> {
         // figure out if nothing else has a real ref on the buffer, and if so, turn this into a BufferRef
         // otherwise return None
-        match self.buffer_header_mut().ref_lock.compare_exchange(
+        // safe to get buffer header since we only access the atomic variable on it
+        match unsafe { self.buffer_header() }.ref_lock.compare_exchange(
             false,
             true,
             Ordering::Acquire,
@@ -44,35 +49,51 @@ impl RawBufferHandle {
                 core::mem::forget(self);
                 Ok(unsafe { RawBufferRef::from_raw(ptr) })
             }
-            Err(_) => Err(self),
+            Err(_) => {
+                if let Some(waker) = waker {
+                    unsafe { self.buffer_header() }
+                        .ref_lock_waker
+                        .register(waker);
+                    return self.try_upgrade(None);
+                }
+                Err(self)
+            }
         }
     }
-    pub(crate) fn buffer_header_mut(&mut self) -> &mut BufferHeader {
+    pub(super) fn buffer_ref_count(&self) -> usize {
+        unsafe { self.buffer_header() }
+            .ref_count
+            .load(Ordering::Relaxed)
+    }
+    pub(super) unsafe fn buffer_header_mut(&mut self) -> &mut BufferHeader {
         unsafe {
             let header_ptr = super::buffer::buffer_header_ptr_mut(self.ptr);
             &mut *header_ptr
         }
     }
-    pub(crate) fn buffer_header(&self) -> &BufferHeader {
+    pub(super) unsafe fn buffer_header(&self) -> &BufferHeader {
         unsafe {
             let header_ptr = super::buffer::buffer_header_ptr(self.ptr);
             &*header_ptr
         }
     }
+    pub(super) fn data_ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
 }
 impl<T> BufferHandle<T> {
     /// Upgrades the `BufferHandle` into a `BufferRef` if there are no other references with exclusive access.
-    pub fn try_upgrade(mut self) -> core::result::Result<BufferRef<T>, Self> {
+    pub fn try_upgrade(
+        mut self,
+        waker: Option<&core::task::Waker>,
+    ) -> core::result::Result<BufferRef<T>, Self> {
         unsafe {
-            match self.handle.try_upgrade() {
+            match self.handle.try_upgrade(waker) {
                 Ok(buf_ref) => Ok(BufferRef::from_raw(buf_ref)),
-                Err(old_ref) => {
-                    println!("failed to upgrade buffer");
-                    Err(BufferHandle {
-                        handle: old_ref,
-                        marker: core::marker::PhantomData,
-                    })
-                }
+                Err(old_ref) => Err(BufferHandle {
+                    handle: old_ref,
+                    marker: core::marker::PhantomData,
+                }),
             }
         }
     }
@@ -88,10 +109,7 @@ impl<T> BufferHandle<T> {
 impl Drop for RawBufferHandle {
     fn drop(&mut self) {
         let ptr = self.ptr;
-        let mut header = self.buffer_header_mut();
-        if header.ref_count.fetch_sub(1, Ordering::Relaxed) == 1 {
-            unsafe { super::buffer::drop_buffer(ptr, header) };
-        }
+        unsafe { super::buffer::drop_buffer(ptr) };
     }
 }
 impl<T> Clone for BufferHandle<T> {
@@ -103,6 +121,7 @@ impl<T> Clone for BufferHandle<T> {
     }
 }
 
+// ptr must point to the data segment of an allocated buffer
 pub(super) unsafe fn make_handle(ptr: NonNull<u8>) -> RawBufferHandle {
     assert!(
         (&*super::buffer::buffer_header_ptr(ptr))

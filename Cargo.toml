@@ -21,3 +21,4 @@ winapi = { version = "0.3", features = [
 async-task = "3"
 parking_lot = "0.10"
 smallvec = "1"
+futures-core = { version = "0.3", default-features = false }

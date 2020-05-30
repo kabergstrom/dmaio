@@ -1,4 +1,15 @@
 use super::{BufferRef, RawBufferRef};
+
+pub(super) struct BufferWriter<'a> {
+    marker: core::marker::PhantomData<&'a ()>,
+}
+impl<'a> BufferWriter<'a> {
+    pub fn new(buffer: &'a mut RawBufferRef) -> Self {
+        Self {
+            marker: core::marker::PhantomData,
+        }
+    }
+}
 impl<T> std::io::Write for BufferRef<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer_ref.write(buf)
@@ -11,8 +22,7 @@ impl std::io::Write for RawBufferRef {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let data_ptr = self.data_ptr();
         let mut header = self.buffer_header_mut();
-        let bytes_remaining =
-            header.data_capacity() - header.data_size() - header.data_start_offset();
+        let bytes_remaining = header.data_capacity() - header.data_size();
         let to_write = core::cmp::min(bytes_remaining as usize, buf.len());
         if to_write > 0 {
             unsafe {

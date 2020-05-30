@@ -1,9 +1,9 @@
 use crate::alloc::alloc::Layout;
 use crate::alloc::sync::Arc;
 use crate::{Error, Result};
+use core::future::Future;
 use core::mem::size_of;
 use core::ptr::null_mut;
-use std::future::Future;
 use winapi::{
     ctypes::c_int,
     shared::{
@@ -62,7 +62,8 @@ impl IOCPQueueBuilder {
             .iter()
             .any(|h| h.completion_key == completion_key)
         {
-            panic!("duplicate completion key registered");
+            // panic!("duplicate completion key registered");
+            return self;
         }
         self.handlers.push(IOCPHandlerRegistration {
             completion_key,
@@ -112,14 +113,8 @@ struct IOCPFutureScheduler;
 impl IOCPHandler for IOCPFutureScheduler {
     fn handle_completion(&self, entry: &OVERLAPPED_ENTRY) -> Result<()> {
         let task = unsafe { async_task::Task::<()>::from_raw(entry.lpOverlapped as *const ()) };
-        let panic = std::panic::catch_unwind(|| {
-            task.run();
-        });
-        if let Err(err) = panic {
-            Err(Error::FuturePanic)
-        } else {
-            Ok(())
-        }
+        task.run();
+        Ok(())
     }
 }
 
@@ -149,8 +144,13 @@ impl IOCPQueueHandle {
         join_handle
     }
 }
-#[derive(Clone)]
 pub struct IOCPQueue(Arc<IOCPQueueInner>, Vec<OVERLAPPED_ENTRY>);
+unsafe impl Send for IOCPQueue {}
+impl Clone for IOCPQueue {
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), Vec::with_capacity(self.1.capacity()))
+    }
+}
 
 impl IOCPQueue {
     pub fn handle(&self) -> IOCPQueueHandle {
@@ -171,6 +171,7 @@ impl IOCPQueue {
             );
             if ret_val != 0 {
                 completion_entries.set_len(num_received_entries as usize);
+                // println!("entries {}", num_received_entries);
                 for i in 0..num_received_entries as usize {
                     let entry = completion_entries.get_unchecked(i);
                     for handler in &self.0.registrations {

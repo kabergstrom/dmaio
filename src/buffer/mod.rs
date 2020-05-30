@@ -2,6 +2,7 @@
 mod buffer;
 #[doc(hidden)]
 mod bufpool;
+mod chain_iter;
 #[doc(hidden)]
 mod handle;
 #[doc(hidden)]
