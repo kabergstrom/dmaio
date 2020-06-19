@@ -83,13 +83,15 @@ impl BufferHeaderInit for IOPacketPool {
 }
 
 pub struct UdpSocketBuilder<T> {
+    socket_addr: std::net::SocketAddr,
     concurrent_receives: u32,
     concurrent_sends: u32,
     marker: core::marker::PhantomData<T>,
 }
 impl<T: AsMut<RIOPacketBuf> + AsRef<WakerContext>> UdpSocketBuilder<T> {
-    pub fn new() -> Self {
+    pub fn new(socket_addr: std::net::SocketAddr) -> Self {
         Self {
+            socket_addr,
             concurrent_receives: 32,
             concurrent_sends: 32,
             marker: core::marker::PhantomData,
@@ -104,7 +106,12 @@ impl<T: AsMut<RIOPacketBuf> + AsRef<WakerContext>> UdpSocketBuilder<T> {
         self
     }
     pub fn build(self, context: &NetContext<T>) -> Result<UdpSocket<T>> {
-        UdpSocket::new(context, self.concurrent_sends, self.concurrent_receives)
+        UdpSocket::bind(
+            context,
+            self.socket_addr,
+            self.concurrent_sends,
+            self.concurrent_receives,
+        )
     }
 }
 pub struct UdpSocket<T> {
@@ -112,6 +119,17 @@ pub struct UdpSocket<T> {
     net_context: NetContext<T>,
 }
 impl<T: AsMut<RIOPacketBuf> + AsRef<WakerContext>> UdpSocket<T> {
+    pub fn bind(
+        context: &NetContext<T>,
+        socket_addr: std::net::SocketAddr,
+        concurrent_sends: u32,
+        concurrent_receives: u32,
+    ) -> Result<Self> {
+        let socket = Self::new(context, concurrent_sends, concurrent_receives)?;
+        socket.bind_socket(socket_addr)?;
+        Ok(socket)
+    }
+    #[doc(hidden)]
     fn new(
         context: &NetContext<T>,
         concurrent_sends: u32,
@@ -152,7 +170,8 @@ impl<T: AsMut<RIOPacketBuf> + AsRef<WakerContext>> UdpSocket<T> {
     //     self.rio_socket.commit_receive_ex().unwrap();
     //     BufferFuture { buf_handle }
     // }
-    pub fn bind(&self, socket_addr: std::net::SocketAddr) -> Result<()> {
+    #[doc(hidden)]
+    fn bind_socket(&self, socket_addr: std::net::SocketAddr) -> Result<()> {
         self.rio_socket.bind(socket_addr)
     }
 }

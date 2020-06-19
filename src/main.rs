@@ -81,11 +81,10 @@ async fn recv_loop(
     server_addr: std::net::SocketAddr,
 ) -> Result<()> {
     println!("start recv loop");
-    let server_socket = UdpSocketBuilder::new()
+    let server_socket = UdpSocketBuilder::new(server_addr)
         .concurrent_sends(SEND_OPS_IN_FLIGHT)
         .concurrent_receives(RECV_OPS_IN_FLIGHT)
         .build(&net_context)?;
-    server_socket.bind(server_addr)?;
     let mut packets_received = 0;
     use net_api::AsyncBufferReadExt;
     let mut packets = Vec::new();
@@ -120,11 +119,10 @@ async fn send_loop(
     client_addr: std::net::SocketAddr,
 ) -> Result<()> {
     println!("start send loop");
-    let client_socket = UdpSocketBuilder::new()
+    let client_socket = UdpSocketBuilder::new(client_addr)
         .concurrent_sends(SEND_OPS_IN_FLIGHT)
         .concurrent_receives(RECV_OPS_IN_FLIGHT)
         .build(&net_context)?;
-    client_socket.bind(client_addr)?;
     let mut packets_sent = 0;
     let mut recv_stream = client_socket.receive();
     let mut packets = Vec::new();
@@ -146,7 +144,7 @@ async fn send_loop(
         }
         let num_new_packets = recv_stream.read(&mut packets).await?;
         packets.clear();
-        packets_sent += 1;
+        packets_sent += len;
         if packets_sent % 100000 == 0 {
             println!("sent {}", packets_sent);
         }

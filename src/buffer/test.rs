@@ -166,7 +166,7 @@ fn buf_prepend_buffer_read() {
 
 #[test]
 #[should_panic(
-    expected = "must have exclusive access to both buffer chains when appending buffer - no handles may be active"
+    expected = "must have exclusive access to `buffer` when appending - no handles may be active"
 )]
 fn buf_append_fail_nonexclusive() {
     unsafe {
@@ -182,7 +182,7 @@ fn buf_append_fail_nonexclusive() {
 
 #[test]
 #[should_panic(
-    expected = "must have exclusive access to both buffer chains when appending buffer - no handles may be active"
+    expected = "must have exclusive access to `buffer` when appending - no handles may be active"
 )]
 fn buf_prepend_fail_nonexclusive() {
     unsafe {
@@ -368,6 +368,84 @@ fn buf_chain_prepend_append_drop_handle() {
             drop(buf1);
             drop(buf2);
             drop(buf3);
+        });
+    }
+}
+
+#[test]
+fn buf_chain_append_owner_test() {
+    unsafe {
+        with_ctx(256, 3, |bufpool| async move {
+            let mut buf1 = bufpool.alloc().await;
+            let mut buf2 = bufpool.alloc().await;
+            let mut buf3 = bufpool.alloc().await;
+            buf1.append_buffer(buf2);
+            buf1.append_buffer(buf3);
+
+            let begin = buf1.chain_begin();
+            let end = buf1.chain_end();
+            assert!(begin == buf1);
+            assert!(end != buf1);
+            let buf1_handle = buf1.make_handle();
+            assert!(end.chain_owner() == Some(buf1_handle));
+        });
+    }
+}
+
+#[test]
+fn buf_chain_prepend_owner_test() {
+    unsafe {
+        with_ctx(256, 3, |bufpool| async move {
+            let mut buf1 = bufpool.alloc().await;
+            let mut buf2 = bufpool.alloc().await;
+            let mut buf3 = bufpool.alloc().await;
+            buf1.prepend_buffer(buf2);
+            buf1.prepend_buffer(buf3);
+
+            let begin = buf1.chain_begin();
+            let end = buf1.chain_end();
+            assert!(begin != buf1);
+            assert!(end == buf1);
+            let buf1_handle = buf1.make_handle();
+            assert!(end.chain_owner() == Some(buf1_handle));
+        });
+    }
+}
+
+#[test]
+fn buf_chain_append_upgrade_test() {
+    unsafe {
+        with_ctx(256, 3, |bufpool| async move {
+            let mut buf1 = bufpool.alloc().await;
+            let mut buf2 = bufpool.alloc().await;
+            let mut buf3 = bufpool.alloc().await;
+            buf1.append_buffer(buf2);
+            buf1.append_buffer(buf3);
+
+            let buf1_handle = buf1.make_handle();
+            drop(buf1);
+            for buf in buf1_handle.chain_begin().chain_iter_forward() {
+                assert!(buf.try_upgrade(None).is_ok());
+            }
+        });
+    }
+}
+
+#[test]
+fn buf_chain_prepend_upgrade_test() {
+    unsafe {
+        with_ctx(256, 3, |bufpool| async move {
+            let mut buf1 = bufpool.alloc().await;
+            let mut buf2 = bufpool.alloc().await;
+            let mut buf3 = bufpool.alloc().await;
+            buf1.prepend_buffer(buf2);
+            buf1.prepend_buffer(buf3);
+
+            let buf1_handle = buf1.make_handle();
+            drop(buf1);
+            for buf in buf1_handle.chain_end().chain_iter_reverse() {
+                assert!(buf.try_upgrade(None).is_ok());
+            }
         });
     }
 }

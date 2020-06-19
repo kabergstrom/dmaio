@@ -28,7 +28,9 @@ impl<'a> std::io::Read for BufferReader<'a> {
                 bytes_read += to_read;
                 if to_read == bytes_remaining as usize {
                     self.chain_buffer_pos = 0;
-                    self.chain_iter = header.next.clone();
+                    self.chain_iter = header
+                        .next
+                        .map(|ptr| unsafe { super::handle::make_handle(ptr) });
                 }
                 if to_read == 0 {
                     break;

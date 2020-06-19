@@ -11,30 +11,82 @@ use crate::Result;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
-pub(super) struct ChainIterForward<'a> {
-    current: Option<RawBufferHandle>,
-    _marker: core::marker::PhantomData<&'a ()>,
+pub struct ChainIterForward<T> {
+    current: Option<BufferHandle<T>>,
 }
-impl<'a> ChainIterForward<'a> {
-    pub(super) fn new(buffer: &'a RawBufferRef) -> Self {
-        ChainIterForward {
-            current: Some(buffer.chain_begin()),
-            _marker: core::marker::PhantomData,
-        }
-    }
-    pub(super) unsafe fn from_handle(handle: RawBufferHandle) -> Self {
+impl<T> ChainIterForward<T> {
+    pub(super) fn new(handle: BufferHandle<T>) -> Self {
         Self {
             current: Some(handle),
-            _marker: core::marker::PhantomData,
         }
     }
 }
-impl<'a> Iterator for ChainIterForward<'a> {
+
+impl<T> Iterator for ChainIterForward<T> {
+    type Item = BufferHandle<T>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(curr) = self.current.take() {
+            self.current = unsafe {
+                curr.raw().buffer_header().next.map(|ptr| BufferHandle {
+                    handle: super::handle::make_handle(ptr),
+                    marker: core::marker::PhantomData,
+                })
+            };
+            Some(curr)
+        } else {
+            None
+        }
+    }
+}
+
+pub struct ChainIterReverse<T> {
+    current: Option<BufferHandle<T>>,
+}
+impl<T> ChainIterReverse<T> {
+    pub(super) fn new(handle: BufferHandle<T>) -> Self {
+        Self {
+            current: Some(handle),
+        }
+    }
+}
+
+impl<T> Iterator for ChainIterReverse<T> {
+    type Item = BufferHandle<T>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(curr) = self.current.take() {
+            self.current = unsafe {
+                curr.raw().buffer_header().prev.map(|ptr| BufferHandle {
+                    handle: super::handle::make_handle(ptr),
+                    marker: core::marker::PhantomData,
+                })
+            };
+            Some(curr)
+        } else {
+            None
+        }
+    }
+}
+
+pub struct ChainIterForwardRaw {
+    current: Option<RawBufferHandle>,
+}
+impl ChainIterForwardRaw {
+    pub(super) fn new(handle: RawBufferHandle) -> Self {
+        Self {
+            current: Some(handle),
+        }
+    }
+}
+
+impl Iterator for ChainIterForwardRaw {
     type Item = RawBufferHandle;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.current.take() {
-            // safe since we keep a borrow with the BufferRef
-            self.current = unsafe { curr.buffer_header() }.next.clone();
+            self.current = unsafe {
+                curr.buffer_header()
+                    .next
+                    .map(|ptr| super::handle::make_handle(ptr))
+            };
             Some(curr)
         } else {
             None
@@ -42,27 +94,68 @@ impl<'a> Iterator for ChainIterForward<'a> {
     }
 }
 
-pub(super) struct ChainIterForwardPtr<'a> {
-    current: Option<NonNull<u8>>,
-    _marker: core::marker::PhantomData<&'a ()>,
+pub struct ChainIterReverseRaw {
+    current: Option<RawBufferHandle>,
 }
-impl<'a> ChainIterForwardPtr<'a> {
-    pub(super) unsafe fn new(ptr: NonNull<u8>) -> Self {
+impl ChainIterReverseRaw {
+    pub(super) fn new(handle: RawBufferHandle) -> Self {
         Self {
-            current: Some(ptr),
-            _marker: core::marker::PhantomData,
+            current: Some(handle),
         }
     }
 }
-impl<'a> Iterator for ChainIterForwardPtr<'a> {
+
+impl Iterator for ChainIterReverseRaw {
+    type Item = RawBufferHandle;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(curr) = self.current.take() {
+            self.current = unsafe {
+                curr.buffer_header()
+                    .prev
+                    .map(|ptr| super::handle::make_handle(ptr))
+            };
+            Some(curr)
+        } else {
+            None
+        }
+    }
+}
+
+pub(super) struct ChainIterForwardPtr {
+    current: Option<NonNull<u8>>,
+}
+impl ChainIterForwardPtr {
+    pub(super) unsafe fn new(ptr: NonNull<u8>) -> Self {
+        Self { current: Some(ptr) }
+    }
+}
+
+impl Iterator for ChainIterForwardPtr {
+    type Item = NonNull<u8>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(curr) = self.current.take() {
+            self.current = unsafe { &*super::buffer::buffer_header_ptr(curr) }.next;
+            Some(curr)
+        } else {
+            None
+        }
+    }
+}
+
+pub(super) struct ChainIterReversePtr {
+    current: Option<NonNull<u8>>,
+}
+impl ChainIterReversePtr {
+    pub(super) unsafe fn new(ptr: NonNull<u8>) -> Self {
+        Self { current: Some(ptr) }
+    }
+}
+impl Iterator for ChainIterReversePtr {
     type Item = NonNull<u8>;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.current.take() {
             // safe since we keep a borrow with the BufferRef
-            self.current = unsafe { &*super::buffer::buffer_header_ptr(curr) }
-                .next
-                .as_ref()
-                .map(|handle| handle.data_ptr());
+            self.current = unsafe { &*super::buffer::buffer_header_ptr(curr) }.prev;
             Some(curr)
         } else {
             None
@@ -70,56 +163,20 @@ impl<'a> Iterator for ChainIterForwardPtr<'a> {
     }
 }
 
-pub(super) struct ChainIterReversePtr<'a> {
-    current: Option<NonNull<u8>>,
-    _marker: core::marker::PhantomData<&'a ()>,
-}
-impl<'a> ChainIterReversePtr<'a> {
-    pub(super) unsafe fn new(ptr: NonNull<u8>) -> Self {
-        Self {
-            current: Some(ptr),
-            _marker: core::marker::PhantomData,
-        }
-    }
-}
-impl<'a> Iterator for ChainIterReversePtr<'a> {
-    type Item = NonNull<u8>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(curr) = self.current.take() {
-            // safe since we keep a borrow with the BufferRef
-            self.current = unsafe { &*super::buffer::buffer_header_ptr(curr) }
-                .prev
-                .as_ref()
-                .map(|handle| handle.data_ptr());
-            Some(curr)
-        } else {
-            None
-        }
-    }
-}
-
-pub(super) fn chain_begin_ptr(ptr: NonNull<u8>) -> NonNull<u8> {
+pub(super) unsafe fn chain_begin_ptr(ptr: NonNull<u8>) -> NonNull<u8> {
     let mut buffer_iter = ptr;
     loop {
-        if let Some(prev) = unsafe { &*super::buffer::buffer_header_ptr(buffer_iter) }
-            .prev
-            .as_ref()
-            .map(|handle| handle.data_ptr())
-        {
+        if let Some(prev) = (&*super::buffer::buffer_header_ptr(buffer_iter)).prev {
             buffer_iter = prev;
         } else {
             break buffer_iter;
         }
     }
 }
-pub(super) fn chain_end_ptr(ptr: NonNull<u8>) -> NonNull<u8> {
+pub(super) unsafe fn chain_end_ptr(ptr: NonNull<u8>) -> NonNull<u8> {
     let mut buffer_iter = ptr;
     loop {
-        if let Some(next) = unsafe { &*super::buffer::buffer_header_ptr(buffer_iter) }
-            .next
-            .as_ref()
-            .map(|handle| handle.data_ptr())
-        {
+        if let Some(next) = (&*super::buffer::buffer_header_ptr(buffer_iter)).next {
             buffer_iter = next;
         } else {
             break buffer_iter;

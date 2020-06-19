@@ -79,6 +79,7 @@ impl BufferPoolHeader {
                 ref_lock_waker: Default::default(),
                 next: None,
                 prev: None,
+                chain_owner: None,
                 bufpool: Some(NonNull::new_unchecked(
                     self as *const BufferPoolHeader as *mut BufferPoolHeader,
                 )),
