@@ -70,9 +70,9 @@ unsafe fn create_completion_port(max_thread_users: u32) -> Result<HANDLE> {
         Err(Error::CreateCompletionPortFailed)
     }
 }
-const PACKET_SIZE: u32 = 64;
-const SEND_OPS_IN_FLIGHT: u32 = 16;
-const RECV_OPS_IN_FLIGHT: u32 = 16;
+const PACKET_SIZE: u32 = 4096;
+const SEND_OPS_IN_FLIGHT: u32 = 64;
+const RECV_OPS_IN_FLIGHT: u32 = 64;
 const SOCKET_BUF_SIZE: u32 = SEND_OPS_IN_FLIGHT * PACKET_SIZE * 16;
 const PACKETS_TO_SEND: usize = 100_000;
 
@@ -94,7 +94,7 @@ async fn recv_loop(
         let num_new_packets = recv_stream.read(&mut packets).await?;
         let len = packets.len();
         for mut recv_packet in packets.drain(0..len) {
-            let mut header = recv_packet.header_mut::<RIOPacketBuf>();
+            let mut header = recv_packet.mut_header::<RIOPacketBuf>();
             header.set_local_addr(None);
             // use std::io::Read;
             // let mut buf = Vec::new();
@@ -134,7 +134,7 @@ async fn send_loop(
             use std::io::Write;
             send_packet.write(&[5u8; PACKET_SIZE as usize]); // write data to packet
             send_packet
-                .header_mut::<RIOPacketBuf>()
+                .mut_header::<RIOPacketBuf>()
                 .set_remote_addr(Some(server_addr)); // set remote address of the send op
             sends.push(client_socket.send(send_packet)?);
         }
@@ -157,9 +157,9 @@ fn main() -> Result<()> {
         rio::wsa_init()?;
         rio::init_rio()?;
     }
-    let num_threads = 16;
+    let num_threads = 8;
     let mut iocp_queues = Vec::new();
-    let num_receivers = 4;
+    let num_receivers = 1;
     let packet_pool = buffer::default_pool(
         RECV_OPS_IN_FLIGHT as usize
             + SEND_OPS_IN_FLIGHT as usize * num_threads * num_receivers * 2 as usize,
@@ -171,8 +171,7 @@ fn main() -> Result<()> {
         let server_addr = format!("127.0.0.1:351{}", j).parse().unwrap();
         let mut iocp_builder = IOCPQueueBuilder::new(1)?;
         let net_context =
-            NetContextBuilder::<IOPacketHeader>::new(&mut iocp_builder, packet_pool.clone())
-                .finish()?;
+            NetContextBuilder::new(&mut iocp_builder, packet_pool.clone()).finish()?;
         let mut iocp = iocp_builder.build()?;
         let spawn_handle = iocp.handle();
         spawn_handle.spawn(async move {
@@ -186,8 +185,7 @@ fn main() -> Result<()> {
         let packet_pool = packet_pool.clone();
         let mut iocp_builder = IOCPQueueBuilder::new(1)?;
         let send_net_context =
-            NetContextBuilder::<IOPacketHeader>::new(&mut iocp_builder, packet_pool.clone())
-                .finish()?;
+            NetContextBuilder::new(&mut iocp_builder, packet_pool.clone()).finish()?;
         let mut iocp = iocp_builder.build()?;
         let spawn_handle = iocp.handle();
         for j in 0..num_receivers {

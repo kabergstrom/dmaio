@@ -27,6 +27,25 @@ pub struct RawBufferRef {
 unsafe impl Send for RawBufferRef {}
 unsafe impl Sync for RawBufferRef {}
 
+/// This trait is unsafe to implement only because mut_segment() and shared_segment() must
+/// not return references to overlapping memory
+pub unsafe trait UserHeader: Send {
+    type Mutable: Send;
+    type Shared: Send + Sync;
+    fn mut_segment(&mut self) -> &mut Self::Mutable;
+    fn shared_segment(&self) -> &Self::Shared;
+}
+unsafe impl UserHeader for () {
+    type Mutable = ();
+    type Shared = ();
+    fn mut_segment(&mut self) -> &mut Self::Mutable {
+        self
+    }
+    fn shared_segment(&self) -> &Self::Shared {
+        &self
+    }
+}
+
 #[derive(Default, Debug)]
 #[doc(hidden)]
 /// Internal header segment that is stored packed before the data segment
@@ -84,7 +103,7 @@ impl<T> BufferRef<T> {
     pub fn raw(&self) -> &RawBufferRef {
         &self.buffer_ref
     }
-    pub unsafe fn into_raw(self) -> RawBufferRef {
+    pub fn into_raw(self) -> RawBufferRef {
         self.buffer_ref
     }
     pub unsafe fn from_raw(raw: RawBufferRef) -> Self {
@@ -93,37 +112,13 @@ impl<T> BufferRef<T> {
             _marker: core::marker::PhantomData,
         }
     }
-    pub fn header_mut<V>(&mut self) -> &mut V
-    where
-        T: AsMut<V>,
-    {
-        self.user_header_mut().as_mut()
-    }
-    pub fn header<V>(&self) -> &V
-    where
-        T: AsRef<V>,
-    {
-        self.user_header().as_ref()
-    }
-    fn user_header(&self) -> &T {
-        unsafe { &*(self.buffer_ref.header_ptr() as *const T) }
-    }
-    fn user_header_mut(&mut self) -> &mut T {
-        unsafe { &mut *(self.buffer_ref.header_ptr() as *mut T) }
-    }
-    pub fn parts(&self) -> (&T, &RawBufferRef) {
-        (self.user_header(), &self.buffer_ref)
-    }
-    pub fn parts_mut(&mut self) -> (&mut T, &mut RawBufferRef) {
-        (
-            unsafe { &mut *(self.buffer_ref.header_ptr() as *mut T) },
-            &mut self.buffer_ref,
-        )
-    }
-    pub fn reserve_front(&mut self, bytes_to_reserve: usize) -> usize {
+    pub fn try_reserve_front(&mut self, bytes_to_reserve: usize) -> bool {
         let raw = self.raw_mut();
         let data_ptr = raw.data_ptr();
         let header = raw.buffer_header_mut();
+        if header.chain_owner.is_some() {
+            todo!("try_reserve_front not implemented for buffer chains");
+        }
         let bytes_remaining = header.data_capacity() - header.data_size();
         let to_reserve = core::cmp::min(bytes_remaining as usize, bytes_to_reserve);
         if to_reserve > 0 && header.data_size() > 0 {
@@ -136,10 +131,14 @@ impl<T> BufferRef<T> {
             }
         }
         *header.data_start_offset_mut() += to_reserve as u32;
-        to_reserve
+        to_reserve == bytes_to_reserve
     }
-    pub fn prepend_write(&mut self, buf: &[u8]) -> usize {
-        let bytes_remaining = self.raw().buffer_header().data_start_offset();
+    pub fn try_prepend_write(&mut self, buf: &[u8]) -> bool {
+        let header = self.raw().buffer_header();
+        if header.chain_owner.is_some() {
+            todo!("try_prepend_write not implemented for buffer chains");
+        }
+        let bytes_remaining = header.data_start_offset();
         let to_write = core::cmp::min(bytes_remaining as usize, buf.len());
         if to_write > 0 {
             unsafe {
@@ -152,7 +151,7 @@ impl<T> BufferRef<T> {
             }
             *self.raw_mut().buffer_header_mut().data_start_offset_mut() -= to_write as u32;
         }
-        to_write
+        to_write == buf.len()
     }
     pub fn append_buffer(&mut self, mut buffer: Self) {
         self.buffer_ref.append_buffer(buffer.buffer_ref);
@@ -196,10 +195,44 @@ impl<T> BufferRef<T> {
             marker: core::marker::PhantomData,
         }
     }
+    fn user_header(&self) -> &T {
+        unsafe { &*(self.buffer_ref.header_ptr() as *const T) }
+    }
+    fn user_header_mut(&mut self) -> &mut T {
+        unsafe { &mut *(self.buffer_ref.header_ptr() as *mut T) }
+    }
+}
+impl<T: UserHeader> BufferRef<T> {
+    pub fn mut_header<V>(&mut self) -> &mut V
+    where
+        <T as UserHeader>::Mutable: AsMut<V>,
+    {
+        self.user_header_mut().mut_segment().as_mut()
+    }
+    pub fn shared_header<V>(&self) -> &V
+    where
+        <T as UserHeader>::Shared: AsRef<V>,
+    {
+        self.user_header().shared_segment().as_ref()
+    }
+    pub fn parts(
+        &mut self,
+    ) -> (
+        &<T as UserHeader>::Shared,
+        &mut <T as UserHeader>::Mutable,
+        &RawBufferRef,
+    ) {
+        // it's safe to grab two separate references here because the UserHeader unsafe trait requires the user to guarantee
+        // shared and mut segments do not overlap in memory
+        let shared_segment =
+            unsafe { &mut *(self.buffer_ref.header_ptr() as *mut T) }.shared_segment();
+        let mut_segment = unsafe { &mut *(self.buffer_ref.header_ptr() as *mut T) }.mut_segment();
+        (shared_segment, mut_segment, &self.buffer_ref)
+    }
 }
 
 impl RawBufferRef {
-    pub unsafe fn into_raw(self) -> NonNull<u8> {
+    pub fn into_raw(self) -> NonNull<u8> {
         let ret_val = self.ptr;
         core::mem::forget(self);
         ret_val
@@ -231,9 +264,7 @@ impl RawBufferRef {
         super::read::BufferReader {
             buffer: self,
             chain_buffer_pos: 0,
-            chain_iter: Some(unsafe {
-                super::handle::make_handle(super::chain_iter::chain_begin_ptr(self.ptr))
-            }),
+            chain_iter: Some(unsafe { super::chain_iter::chain_begin_ptr(self.ptr) }),
         }
     }
     pub fn chain_owner(&self) -> Option<RawBufferHandle> {
@@ -260,9 +291,7 @@ impl RawBufferRef {
         unsafe { super::handle::make_handle(self.ptr) }
     }
     fn buffer_ref_count(&self) -> usize {
-        unsafe { self.buffer_header() }
-            .ref_count
-            .load(Ordering::Relaxed)
+        self.buffer_header().ref_count.load(Ordering::Relaxed)
     }
 
     pub fn prepend_buffer(&mut self, mut buffer: RawBufferRef) {
@@ -333,11 +362,11 @@ impl RawBufferRef {
 
 impl Drop for RawBufferRef {
     fn drop(&mut self) {
+        self.buffer_header()
+            .ref_lock
+            .store(false, Ordering::Release);
+        self.buffer_header().ref_lock_waker.wake();
         unsafe {
-            self.buffer_header()
-                .ref_lock
-                .store(false, Ordering::Release);
-            self.buffer_header().ref_lock_waker.wake();
             drop_buffer(self.ptr);
         }
     }
@@ -348,6 +377,9 @@ pub(super) fn buffer_header_ptr_mut(ptr: NonNull<u8>) -> *mut BufferHeader {
 }
 pub(super) fn buffer_header_ptr(ptr: NonNull<u8>) -> *const BufferHeader {
     unsafe { ptr.as_ptr().sub(core::mem::size_of::<BufferHeader>()) as *const BufferHeader }
+}
+pub(super) fn buffer_data_ptr(header: &BufferHeader, buffer_ptr: NonNull<u8>) -> NonNull<u8> {
+    buffer_ptr
 }
 unsafe fn drop_buffer_chain(buf_ptr: NonNull<u8>, header: &mut BufferHeader) {
     if let Some(next) = header.next {
@@ -394,26 +426,4 @@ unsafe fn free_buffer(buf_ptr: NonNull<u8>) {
         .as_ref()
         .free_bufref(RawBufferRef::from_raw(buf_ptr));
     super::bufpool::decrement_refcount(bufpool_ref);
-}
-
-unsafe fn iter_chain_clear_until_self<F: FnMut(&mut BufferHeader), G: FnMut(&mut BufferHeader)>(
-    this: NonNull<u8>,
-    mut chain_iter: impl Iterator<Item = NonNull<u8>>,
-    mut clear_next_func: F,
-    mut clear_prev_func: G,
-) {
-    let mut prev: Option<NonNull<u8>> = None;
-    while let Some(mut curr) = chain_iter.next() {
-        if let Some(mut prev) = prev.take() {
-            clear_next_func((&mut *buffer_header_ptr_mut(prev)));
-        }
-        if curr == this {
-            break;
-        }
-        clear_prev_func((&mut *buffer_header_ptr_mut(curr)));
-        prev = Some(curr);
-    }
-    if let Some(mut prev) = prev.take() {
-        clear_prev_func((&mut *buffer_header_ptr_mut(prev)));
-    }
 }

@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 use crate::alloc::sync::Arc;
-use crate::buffer::{BufferRef, RawBufferRef};
+use crate::buffer::{BufferRef, RawBufferRef, UserHeader};
 use crate::rio_buf::RIOPacketBuf;
 use crate::{Error, Result};
 use core::mem::{size_of, MaybeUninit};
@@ -396,11 +396,14 @@ impl RIOSocket {
         }
     }
 
-    pub fn receive_ex<T: AsMut<RIOPacketBuf>>(
+    pub fn receive_ex<T: UserHeader>(
         &self,
         mut packet: BufferRef<T>,
         waker: Option<&Waker>,
-    ) -> (Result<()>, Option<BufferRef<T>>) {
+    ) -> (Result<()>, Option<BufferRef<T>>)
+    where
+        <T as UserHeader>::Mutable: AsMut<RIOPacketBuf>,
+    {
         let mut state_guard = self.0.state.lock();
         if state_guard.recv_slots_open == 0 {
             if let Some(waker) = waker {
@@ -408,10 +411,10 @@ impl RIOSocket {
             }
             return (Err(Error::SlotsExhausted), Some(packet));
         }
+        // println!("start op {:?}", RIOOpType::Receive);
+        let (_, mut header, raw) = packet.parts();
+        let mut header = header.as_mut();
         unsafe {
-            // println!("start op {:?}", RIOOpType::Receive);
-            let (mut header, raw) = packet.parts_mut();
-            let mut header = header.as_mut();
             let mut data_buf = header.data_rio_buf(raw, raw.buffer_header().data_capacity());
             let mut local_addr_buf = header.local_addr_rio_buf(raw);
             let mut remote_addr_buf = header.remote_addr_rio_buf(raw);
@@ -495,11 +498,14 @@ impl RIOSocket {
             waker.wake();
         }
     }
-    pub fn send_ex<T: AsMut<RIOPacketBuf>>(
+    pub fn send_ex<T: UserHeader>(
         &self,
         mut packet: BufferRef<T>,
         waker: Option<&Waker>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        <T as UserHeader>::Mutable: AsMut<RIOPacketBuf>,
+    {
         let mut state_guard = self.0.state.lock();
         if state_guard.send_slots_open == 0 {
             if let Some(waker) = waker {
@@ -508,9 +514,9 @@ impl RIOSocket {
             println!("send exhausted");
             return Err(Error::SlotsExhausted);
         }
+        let (_, mut_segment, raw) = packet.parts();
+        let mut header = mut_segment.as_mut();
         unsafe {
-            let (mut header, raw) = packet.parts_mut();
-            let mut header = header.as_mut();
             let mut data_buf = header.data_rio_buf(raw, raw.buffer_header().data_size());
             let mut local_addr_buf = header.local_addr_rio_buf(raw);
             let mut remote_addr_buf = header.remote_addr_rio_buf(raw);
@@ -710,65 +716,70 @@ impl RIOQueue {
         let mut state = self.0.state.lock();
         state.socket_slots_open += num_slots;
     }
-    pub unsafe fn dequeue_completions<T: AsMut<RIOPacketBuf>>(
+    pub fn dequeue_completions<T: UserHeader>(
         &self,
         results_buf: &mut Vec<RIOCompletion<T>>,
-    ) -> Result<usize> {
+    ) -> Result<usize>
+    where
+        <T as UserHeader>::Mutable: AsMut<RIOPacketBuf>,
+    {
         let mut state = self.0.state.lock();
         let mut results_buffer = &mut state.results_buffer;
         debug_assert!(results_buf.is_empty());
         debug_assert!(results_buf.len() <= results_buffer.capacity());
-        let num_completions = rio_vtable().DequeueCompletion(
-            self.0.cq,
-            results_buffer.as_mut_ptr(),
-            results_buffer.capacity() as u32,
-        )? as usize;
-        results_buffer.set_len(num_completions);
-        for i in 0..num_completions {
-            let rio_result = results_buffer.get_unchecked(i);
-            let mut packet_buf = BufferRef::<T>::from_raw(RawBufferRef::from_raw(
-                NonNull::new_unchecked(rio_result.RequestContext as *mut u8),
-            ));
-            let result = if rio_result.Status == 0 {
-                Ok(())
-            } else {
-                Err(Error::WSAErr("RIORESULT", rio_result.Status))
-            };
-            let mut header_mut = packet_buf.header_mut::<RIOPacketBuf>();
-            let op_type = header_mut.active_op;
-            header_mut.active_op = RIOOpType::None;
-            match op_type {
-                RIOOpType::Send => {
-                    let socket = header_mut
-                        .op_socket
-                        .take()
-                        .expect("socket was not set when completing a RIO send");
-                    socket.complete_send();
-                }
-                RIOOpType::Receive => {
-                    let socket = header_mut
-                        .op_socket
-                        .take()
-                        .expect("socket was not set when completing a RIO receive");
-                    socket.complete_receive();
-                    if result.is_ok() {
-                        packet_buf
-                            .raw_mut()
-                            .buffer_header_mut()
-                            .set_data_size(rio_result.BytesTransferred);
+        unsafe {
+            let num_completions = rio_vtable().DequeueCompletion(
+                self.0.cq,
+                results_buffer.as_mut_ptr(),
+                results_buffer.capacity() as u32,
+            )? as usize;
+            results_buffer.set_len(num_completions);
+            for i in 0..num_completions {
+                let rio_result = results_buffer.get_unchecked(i);
+                let mut packet_buf = BufferRef::<T>::from_raw(RawBufferRef::from_raw(
+                    NonNull::new_unchecked(rio_result.RequestContext as *mut u8),
+                ));
+                let result = if rio_result.Status == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::WSAErr("RIORESULT", rio_result.Status))
+                };
+                let mut header_mut = packet_buf.mut_header::<RIOPacketBuf>();
+                let op_type = header_mut.active_op;
+                header_mut.active_op = RIOOpType::None;
+                match op_type {
+                    RIOOpType::Send => {
+                        let socket = header_mut
+                            .op_socket
+                            .take()
+                            .expect("socket was not set when completing a RIO send");
+                        socket.complete_send();
                     }
+                    RIOOpType::Receive => {
+                        let socket = header_mut
+                            .op_socket
+                            .take()
+                            .expect("socket was not set when completing a RIO receive");
+                        socket.complete_receive();
+                        if result.is_ok() {
+                            packet_buf
+                                .raw_mut()
+                                .buffer_header_mut()
+                                .set_data_size(rio_result.BytesTransferred);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+                let completion = RIOCompletion {
+                    packet_buf,
+                    result,
+                    op_type,
+                };
+                core::ptr::write(results_buf.as_mut_ptr().add(i), completion);
             }
-            let completion = RIOCompletion {
-                packet_buf,
-                result,
-                op_type,
-            };
-            core::ptr::write(results_buf.as_mut_ptr().add(i), completion);
+            results_buf.set_len(num_completions);
+            Ok(num_completions)
         }
-        results_buf.set_len(num_completions);
-        Ok(num_completions)
     }
 }
 impl Drop for RIOQueueInner {

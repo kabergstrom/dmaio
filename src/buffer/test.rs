@@ -103,10 +103,10 @@ fn buf_reserve_front() {
         let buf_data_size = 256;
         with_ctx(256, 1, |bufpool| async move {
             let mut buf = bufpool.alloc().await;
-            assert_eq!(255, buf.reserve_front(255));
+            assert_eq!(true, buf.try_reserve_front(255));
             let ref_value = [3u8; 512]; // try to write more than the buffer can hold
             assert_eq!(1, buf.write(&ref_value).unwrap());
-            assert_eq!(0, buf.reserve_front(1));
+            assert_eq!(false, buf.try_reserve_front(1));
         });
     }
 }
@@ -127,8 +127,7 @@ fn buf_append_buffer_read() {
             buf1.append_buffer(buf2);
             let mut read_value = [0u8; 512];
             let mut reader = buf1.reader();
-            assert_eq!(256, reader.read(&mut read_value[0..256]).unwrap());
-            assert_eq!(256, reader.read(&mut read_value[256..512]).unwrap());
+            assert_eq!(512, reader.read(&mut read_value).unwrap());
             for i in 0..512 {
                 assert_eq!(read_value[i], ref_value[i]);
             }
@@ -155,8 +154,7 @@ fn buf_prepend_buffer_read() {
             let mut read_value = [0u8; 512];
             let mut reader = buf2.reader();
             println!("reading data");
-            assert_eq!(256, reader.read(&mut read_value[0..256]).unwrap());
-            assert_eq!(256, reader.read(&mut read_value[256..512]).unwrap());
+            assert_eq!(512, reader.read(&mut read_value).unwrap());
             for i in 0..512 {
                 assert_eq!(read_value[i], ref_value[i]);
             }
@@ -449,3 +447,39 @@ fn buf_chain_prepend_upgrade_test() {
         });
     }
 }
+
+#[test]
+fn buf_chain_read_write() {
+    unsafe {
+        with_ctx(256, 3, |bufpool| async move {
+            let mut buf1 = bufpool.alloc().await;
+            let mut buf2 = bufpool.alloc().await;
+            let mut buf3 = bufpool.alloc().await;
+            buf1.prepend_buffer(buf2);
+            buf1.prepend_buffer(buf3);
+            use std::io::{Read, Write};
+            let mut ref_value = [0u8; 256 * 3];
+            for i in 0..ref_value.len() {
+                ref_value[i] = i as u8;
+            }
+            assert_eq!(ref_value.len(), buf1.write(&ref_value).unwrap());
+            let mut read_value = [0u8; 256 * 3];
+            let mut reader = buf1.reader();
+            assert_eq!(ref_value.len(), reader.read(&mut read_value).unwrap());
+            assert_eq!(0, reader.read(&mut read_value).unwrap());
+            for i in 0..ref_value.len() {
+                assert_eq!(read_value[i], ref_value[i]);
+            }
+        });
+    }
+}
+
+// #[test]
+// fn buf_chain_reserve() {
+//     todo!("test reserve in buffer chains")
+// }
+
+// #[test]
+// fn buf_chain_prepend_write() {
+//     todo!("test prepend write in buffer chains")
+// }

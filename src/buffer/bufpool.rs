@@ -420,18 +420,22 @@ fn ensure_divisible(val: usize, divisor: usize) -> usize {
     }
 }
 
-pub unsafe fn page_size() -> usize {
-    let mut info = sysinfoapi::SYSTEM_INFO::default();
-    sysinfoapi::GetSystemInfo(&mut info as *mut _);
-    info.dwPageSize as usize
+pub fn page_size() -> usize {
+    unsafe {
+        let mut info = sysinfoapi::SYSTEM_INFO::default();
+        sysinfoapi::GetSystemInfo(&mut info as *mut _);
+        info.dwPageSize as usize
+    }
 }
-pub unsafe fn allocation_granularity() -> usize {
-    let mut info = sysinfoapi::SYSTEM_INFO::default();
-    sysinfoapi::GetSystemInfo(&mut info as *mut _);
-    info.dwAllocationGranularity as usize
+pub fn allocation_granularity() -> usize {
+    unsafe {
+        let mut info = sysinfoapi::SYSTEM_INFO::default();
+        sysinfoapi::GetSystemInfo(&mut info as *mut _);
+        info.dwAllocationGranularity as usize
+    }
 }
-pub unsafe fn large_page_minimum() -> usize {
-    memoryapi::GetLargePageMinimum()
+pub fn large_page_minimum() -> usize {
+    unsafe { memoryapi::GetLargePageMinimum() }
 }
 fn layout_padding_needed_for(layout: &Layout, align: usize) -> usize {
     let len = layout.size();

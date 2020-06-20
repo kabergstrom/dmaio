@@ -15,7 +15,7 @@ mod write;
 
 pub(crate) use buffer::BufferHeader;
 #[doc(inline)]
-pub use buffer::{BufferRef, RawBufferRef};
+pub use buffer::{BufferRef, RawBufferRef, UserHeader};
 #[doc(inline)]
 pub use bufpool::{default_pool, BufferHeaderInit, BufferPool, BufferPoolHeader};
 #[doc(inline)]

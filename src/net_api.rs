@@ -1,4 +1,6 @@
-use crate::buffer::{BufferHandle, BufferHeaderInit, BufferPool, BufferPoolHeader, BufferRef};
+use crate::buffer::{
+    BufferHandle, BufferHeaderInit, BufferPool, BufferPoolHeader, BufferRef, UserHeader,
+};
 use crate::iocp::{IOCPHandler, IOCPQueueBuilder};
 use crate::rio::{RIOCompletion, RIOQueue, RIOSocket};
 use crate::rio_buf::{RIOPacketBuf, RIOPacketPool};
@@ -37,24 +39,14 @@ pub struct IOPacketHeader {
     rio: RIOPacketBuf,
     waker: WakerContext,
 }
-impl AsMut<WakerContext> for IOPacketHeader {
-    fn as_mut(&mut self) -> &mut WakerContext {
-        &mut self.waker
-    }
-}
-impl AsRef<WakerContext> for IOPacketHeader {
-    fn as_ref(&self) -> &WakerContext {
-        &self.waker
-    }
-}
-impl AsMut<RIOPacketBuf> for IOPacketHeader {
-    fn as_mut(&mut self) -> &mut RIOPacketBuf {
+unsafe impl UserHeader for IOPacketHeader {
+    type Mutable = RIOPacketBuf;
+    type Shared = WakerContext;
+    fn mut_segment(&mut self) -> &mut Self::Mutable {
         &mut self.rio
     }
-}
-impl AsRef<RIOPacketBuf> for IOPacketHeader {
-    fn as_ref(&self) -> &RIOPacketBuf {
-        &self.rio
+    fn shared_segment(&self) -> &Self::Shared {
+        &self.waker
     }
 }
 
@@ -88,7 +80,11 @@ pub struct UdpSocketBuilder<T> {
     concurrent_sends: u32,
     marker: core::marker::PhantomData<T>,
 }
-impl<T: AsMut<RIOPacketBuf> + AsRef<WakerContext>> UdpSocketBuilder<T> {
+impl<T: UserHeader> UdpSocketBuilder<T>
+where
+    <T as UserHeader>::Mutable: AsMut<RIOPacketBuf>,
+    <T as UserHeader>::Shared: AsRef<WakerContext>,
+{
     pub fn new(socket_addr: std::net::SocketAddr) -> Self {
         Self {
             socket_addr,
@@ -118,7 +114,11 @@ pub struct UdpSocket<T> {
     rio_socket: RIOSocket,
     net_context: NetContext<T>,
 }
-impl<T: AsMut<RIOPacketBuf> + AsRef<WakerContext>> UdpSocket<T> {
+impl<T: UserHeader> UdpSocket<T>
+where
+    <T as UserHeader>::Mutable: AsMut<RIOPacketBuf>,
+    <T as UserHeader>::Shared: AsRef<WakerContext>,
+{
     pub fn bind(
         context: &NetContext<T>,
         socket_addr: std::net::SocketAddr,
@@ -146,7 +146,7 @@ impl<T: AsMut<RIOPacketBuf> + AsRef<WakerContext>> UdpSocket<T> {
         })
     }
     pub fn send(&self, packet_buf: BufferRef<T>) -> Result<impl Future<Output = Result<()>>> {
-        packet_buf.header::<WakerContext>().start_op(None);
+        packet_buf.shared_header::<WakerContext>().start_op(None);
         let buf_handle = packet_buf.make_handle();
         self.rio_socket.send_ex(packet_buf, None)?; // TODO wait on slot exhaustion instead of propagating error
         self.rio_socket.commit_send_ex()?;
@@ -189,30 +189,32 @@ struct RIOQueueHandlerInner<T> {
     results_buf: Vec<RIOCompletion<T>>,
 }
 struct RIOQueueHandler<T>(Mutex<RIOQueueHandlerInner<T>>);
-impl<T: AsMut<RIOPacketBuf> + AsMut<WakerContext>> IOCPHandler for RIOQueueHandler<T> {
+impl<T: UserHeader> IOCPHandler for RIOQueueHandler<T>
+where
+    <T as UserHeader>::Mutable: AsMut<RIOPacketBuf>,
+    <T as UserHeader>::Shared: AsRef<WakerContext>,
+{
     fn handle_completion(&self, entry: &winapi::um::minwinbase::OVERLAPPED_ENTRY) -> Result<()> {
         let mut inner = self.0.lock();
         let mut iter = 0;
 
         loop {
-            unsafe {
-                let results_buf = &mut inner.results_buf;
-                let rio_queue = RIOQueue::from_overlapped(&*entry.lpOverlapped);
-                let num_completions = rio_queue.dequeue_completions(results_buf)?;
-                for mut completion in results_buf.drain(0..num_completions) {
-                    let mut waker_header = completion.packet_buf.header_mut::<WakerContext>();
-                    waker_header.complete_op(completion.result.clone());
-                    // println!("finish op {:?}", completion.op_type);
-                    drop(completion);
+            let results_buf = &mut inner.results_buf;
+            let rio_queue = unsafe { RIOQueue::from_overlapped(&*entry.lpOverlapped) };
+            let num_completions = rio_queue.dequeue_completions(results_buf)?;
+            for mut completion in results_buf.drain(0..num_completions) {
+                let mut waker_header = completion.packet_buf.shared_header::<WakerContext>();
+                waker_header.complete_op(completion.result.clone());
+                // println!("finish op {:?}", completion.op_type);
+                drop(completion);
+            }
+            // println!("{}", num_completions);
+            iter += 1;
+            if iter >= 20 || num_completions == 0 {
+                if num_completions == 0 {
+                    rio_queue.poke();
                 }
-                // println!("{}", num_completions);
-                iter += 1;
-                if iter >= 20 || num_completions == 0 {
-                    if num_completions == 0 {
-                        rio_queue.poke();
-                    }
-                    break;
-                }
+                break;
             }
         }
         // if num_completions > 0 {
@@ -222,7 +224,11 @@ impl<T: AsMut<RIOPacketBuf> + AsMut<WakerContext>> IOCPHandler for RIOQueueHandl
     }
 }
 
-impl<'a, T: AsMut<RIOPacketBuf> + AsMut<WakerContext> + 'static> NetContextBuilder<'a, T> {
+impl<'a, T: UserHeader + 'static> NetContextBuilder<'a, T>
+where
+    <T as UserHeader>::Mutable: AsMut<RIOPacketBuf>,
+    <T as UserHeader>::Shared: AsRef<WakerContext>,
+{
     pub fn new(iocp_builder: &'a mut IOCPQueueBuilder, buffer_pool: BufferPool<T>) -> Self {
         Self {
             iocp_builder,
@@ -278,6 +284,11 @@ struct WakerContextInner {
     has_op: bool,
 }
 pub struct WakerContext(Mutex<WakerContextInner>);
+impl AsRef<WakerContext> for WakerContext {
+    fn as_ref(&self) -> &WakerContext {
+        self
+    }
+}
 
 use std::sync::atomic::Ordering;
 static LOL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -332,13 +343,15 @@ impl WakerContext {
 struct BufferFuture<T> {
     buf_handle: BufferHandle<T>,
 }
-impl<T: AsRef<WakerContext>> Future for BufferFuture<T> {
+impl<T: UserHeader> Future for BufferFuture<T>
+where
+    <T as UserHeader>::Shared: AsRef<WakerContext>,
+{
     type Output = Result<()>;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         // it's safe to get a ref to the waker context through a non-exclusive pointer despite any existing exclusive access,
         // because it is internally protected by a mutex
-        let waker_ctx =
-            unsafe { AsRef::<WakerContext>::as_ref(&*self.buf_handle.user_header_ptr()) };
+        let waker_ctx = self.buf_handle.shared_header();
         match waker_ctx.poll(cx.waker()) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => match self.buf_handle.clone().try_upgrade(Some(cx.waker())) {
@@ -364,7 +377,11 @@ struct ReceiveFuture<T> {
 }
 impl<T> Unpin for ReceiveFuture<T> {}
 
-impl<T: AsRef<WakerContext> + AsMut<RIOPacketBuf>> AsyncBufferRead<T> for ReceiveFuture<T> {
+impl<T: UserHeader> AsyncBufferRead<T> for ReceiveFuture<T>
+where
+    <T as UserHeader>::Shared: AsRef<WakerContext>,
+    <T as UserHeader>::Mutable: AsMut<RIOPacketBuf>,
+{
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context,
@@ -372,7 +389,7 @@ impl<T: AsRef<WakerContext> + AsMut<RIOPacketBuf>> AsyncBufferRead<T> for Receiv
     ) -> Poll<Result<usize>> {
         let mut buffers_received = 0;
         for (idx, buffer) in self.pending_receives.iter().enumerate() {
-            let waker_ctx = unsafe { AsRef::<WakerContext>::as_ref(&*buffer.user_header_ptr()) };
+            let waker_ctx = buffer.shared_header();
             match waker_ctx.poll(cx.waker()) {
                 Poll::Pending => {}
                 Poll::Ready(result) => {
@@ -396,7 +413,7 @@ impl<T: AsRef<WakerContext> + AsMut<RIOPacketBuf>> AsyncBufferRead<T> for Receiv
         while self.pending_receives.len() < self.socket.total_recv_slots() as usize {
             if let Some(recv_buffer) = self.net_context.try_alloc(Some(cx.waker())) {
                 recv_buffer
-                    .header::<WakerContext>()
+                    .shared_header::<WakerContext>()
                     .start_op(Some(cx.waker()));
                 let buffer_handle = recv_buffer.make_handle();
                 let (result, _) = self.socket.receive_ex(recv_buffer, Some(cx.waker()));

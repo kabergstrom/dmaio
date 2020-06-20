@@ -1,4 +1,4 @@
-use super::buffer::{BufferHeader, BufferRef, RawBufferRef};
+use super::buffer::{BufferHeader, BufferRef, RawBufferRef, UserHeader};
 use super::bufpool::{BufferPool, BufferPoolHeader};
 use super::chain_iter::{
     ChainIterForward, ChainIterForwardRaw, ChainIterReverse, ChainIterReverseRaw,
@@ -46,7 +46,7 @@ impl RawBufferHandle {
         waker: Option<&core::task::Waker>,
     ) -> core::result::Result<RawBufferRef, Self> {
         unsafe {
-            let header = &*super::buffer::buffer_header_ptr(self.ptr);
+            let header = self.buffer_header();
             // figure out if nothing else has a real ref on the buffer, and if so, turn this into a BufferRef
             // otherwise return None
             // safe to get buffer header since we only access the atomic variable on it
@@ -73,19 +73,13 @@ impl RawBufferHandle {
     }
     pub(super) fn buffer_ref_count(&self) -> usize {
         unsafe {
-            let header = &*super::buffer::buffer_header_ptr(self.ptr);
+            let header = self.buffer_header();
             let owning_buffer_header = if let Some(owner) = header.chain_owner {
                 &*super::buffer::buffer_header_ptr(owner)
             } else {
                 header
             };
             header.ref_count.load(Ordering::Relaxed)
-        }
-    }
-    pub(super) unsafe fn buffer_header_mut(&mut self) -> &mut BufferHeader {
-        unsafe {
-            let header_ptr = super::buffer::buffer_header_ptr_mut(self.ptr);
-            &mut *header_ptr
         }
     }
     pub(super) unsafe fn buffer_header(&self) -> &BufferHeader {
@@ -139,33 +133,9 @@ struct BufferUpgradeFuture<T> {
 // }
 
 impl<T> BufferHandle<T> {
-    /// Upgrades the `BufferHandle` into a `BufferRef` if there are no other references with exclusive access.
-    pub fn try_upgrade(
-        mut self,
-        waker: Option<&core::task::Waker>,
-    ) -> core::result::Result<BufferRef<T>, Self> {
-        unsafe {
-            match self.handle.try_upgrade(waker) {
-                Ok(buf_ref) => Ok(BufferRef::from_raw(buf_ref)),
-                Err(old_ref) => Err(BufferHandle {
-                    handle: old_ref,
-                    marker: core::marker::PhantomData,
-                }),
-            }
-        }
-    }
     pub fn raw(&self) -> &RawBufferHandle {
         &self.handle
     }
-    pub unsafe fn user_header_ptr(&self) -> *const T {
-        unsafe {
-            self.handle
-                .ptr
-                .as_ptr()
-                .sub(self.handle.buffer_header().header_size as usize) as *const T
-        }
-    }
-
     pub fn chain_owner(&self) -> Option<BufferHandle<T>> {
         unsafe {
             self.raw().buffer_header().chain_owner.map(|o| unsafe {
@@ -198,6 +168,46 @@ impl<T> BufferHandle<T> {
             }
         }
     }
+    /// Upgrades the `BufferHandle` into a `BufferRef` if there are no other references with exclusive access.
+    pub fn try_upgrade(
+        mut self,
+        waker: Option<&core::task::Waker>,
+    ) -> core::result::Result<BufferRef<T>, Self> {
+        unsafe {
+            match self.handle.try_upgrade(waker) {
+                Ok(buf_ref) => Ok(BufferRef::from_raw(buf_ref)),
+                Err(old_ref) => Err(BufferHandle {
+                    handle: old_ref,
+                    marker: core::marker::PhantomData,
+                }),
+            }
+        }
+    }
+    pub unsafe fn user_header_ptr(&self) -> *const T {
+        unsafe {
+            self.handle
+                .ptr
+                .as_ptr()
+                .sub(self.handle.buffer_header().header_size as usize) as *const T
+        }
+    }
+}
+
+impl<T: UserHeader> BufferHandle<T> {
+    pub fn shared_header<V>(&self) -> &V
+    where
+        <T as UserHeader>::Shared: AsRef<V>,
+    {
+        unsafe {
+            let userdata = self
+                .handle
+                .ptr
+                .as_ptr()
+                .sub(self.handle.buffer_header().header_size as usize)
+                as *const T;
+            (&*userdata).shared_segment().as_ref()
+        }
+    }
 }
 
 impl Drop for RawBufferHandle {
@@ -215,13 +225,13 @@ impl<T> Clone for BufferHandle<T> {
     }
 }
 
-impl<T> PartialEq<BufferHandle<T>> for BufferHandle<T> {
+impl<T: UserHeader> PartialEq<BufferHandle<T>> for BufferHandle<T> {
     fn eq(&self, other: &BufferHandle<T>) -> bool {
         self.handle.ptr == other.handle.ptr
     }
 }
 
-impl<T> PartialEq<BufferRef<T>> for BufferHandle<T> {
+impl<T: UserHeader> PartialEq<BufferRef<T>> for BufferHandle<T> {
     fn eq(&self, other: &BufferRef<T>) -> bool {
         self.handle.ptr == other.raw().ptr
     }
@@ -239,7 +249,7 @@ impl<T> PartialEq<BufferHandle<T>> for RawBufferHandle {
     }
 }
 
-impl<T> PartialEq<BufferRef<T>> for RawBufferHandle {
+impl<T: UserHeader> PartialEq<BufferRef<T>> for RawBufferHandle {
     fn eq(&self, other: &BufferRef<T>) -> bool {
         self.ptr == other.raw().ptr
     }
