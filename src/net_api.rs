@@ -1,7 +1,7 @@
 use crate::buffer::{
     BufferHandle, BufferHeaderInit, BufferPool, BufferPoolHeader, BufferRef, UserHeader,
 };
-use crate::iocp::{IOCPHandler, IOCPQueueBuilder};
+use crate::iocp::{IOCPHandler, IOCPHeader, IOCPQueueBuilder};
 use crate::rio::{RIOCompletion, RIOQueue, RIOSocket};
 use crate::rio_buf::{RIOPacketBuf, RIOPacketPool};
 use crate::{Error, Result};
@@ -159,17 +159,6 @@ where
             socket: self.rio_socket.clone(),
         }
     }
-    // pub fn receive(
-    //     &self,
-    //     packet_buf: BufferRef<T>,
-    // ) -> impl Future<Output = (BufferRef<T>, Result<()>)> {
-    //     packet_buf.header::<WakerContext>().start_op();
-    //     let buf_handle = packet_buf.make_handle();
-    //     // TODO make the whole receive/send flow a future to handle exhaustion of send/receive slots
-    //     self.rio_socket.receive_ex(packet_buf, None).unwrap(); // TODO push the result into the buffer ref, and immediately return
-    //     self.rio_socket.commit_receive_ex().unwrap();
-    //     BufferFuture { buf_handle }
-    // }
     #[doc(hidden)]
     fn bind_socket(&self, socket_addr: std::net::SocketAddr) -> Result<()> {
         self.rio_socket.bind(socket_addr)
@@ -200,26 +189,30 @@ where
 
         loop {
             let results_buf = &mut inner.results_buf;
-            let rio_queue = unsafe { RIOQueue::from_overlapped(&*entry.lpOverlapped) };
+
+            let rio_queue = unsafe {
+                let iocp_payload = &*IOCPHeader::get_payload_ptr(entry.lpOverlapped);
+                RIOQueue::from_overlapped_ptr(
+                    iocp_payload.ptr.expect("rio queue pointer null").as_ptr(),
+                )
+            };
             let num_completions = rio_queue.dequeue_completions(results_buf)?;
             for mut completion in results_buf.drain(0..num_completions) {
-                let mut waker_header = completion.packet_buf.shared_header::<WakerContext>();
-                waker_header.complete_op(completion.result.clone());
-                // println!("finish op {:?}", completion.op_type);
+                let buffer = completion.packet_buf.make_handle();
+                let result = completion.result.clone();
                 drop(completion);
+                let mut waker_header = buffer.shared_header::<WakerContext>();
+                waker_header.complete_op(result);
+                // println!("finish op {:?}", completion.op_type);
             }
             // println!("{}", num_completions);
             iter += 1;
             if iter >= 20 || num_completions == 0 {
-                if num_completions == 0 {
-                    rio_queue.poke();
-                }
+                rio_queue.poke(); // this queues another IOCP packet for the rio queue to ensure we get all completions
+                                  // doesn't really make sense to me, but CPU usage doesn't seem to be high despite this
                 break;
             }
         }
-        // if num_completions > 0 {
-        //     rio_queue.poke()?;
-        // }
         Ok(())
     }
 }
@@ -278,6 +271,7 @@ impl BufferHeaderInit for WakerContextInit {
         }))
     }
 }
+// fix ABA issue? is it possible?
 struct WakerContextInner {
     pending_wakers: SmallVec<[Waker; 1]>,
     op_result: Poll<Result<()>>,
@@ -290,8 +284,6 @@ impl AsRef<WakerContext> for WakerContext {
     }
 }
 
-use std::sync::atomic::Ordering;
-static LOL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 impl WakerContext {
     pub fn start_op(&self, waker: Option<&Waker>) {
         let mut inner = self.0.lock();
@@ -304,11 +296,6 @@ impl WakerContext {
         }
         if let Some(waker) = waker {
             wakers.push(waker.clone());
-            // println!(
-            //     "registering {:?} {}",
-            //     waker,
-            //     LOL.fetch_add(1, Ordering::Relaxed)
-            // );
         }
     }
     pub fn complete_op(&self, op_result: Result<()>) {
@@ -318,11 +305,11 @@ impl WakerContext {
         let mut wakers = &mut inner.pending_wakers;
         let len = wakers.len();
         for waker in wakers.drain(0..len) {
-            // println!("waking {:?} {}", waker, LOL.fetch_sub(1, Ordering::Relaxed));
             waker.wake()
         }
         // assert!(len > 0);
     }
+
     pub fn poll(&self, waker: &Waker) -> Poll<Result<()>> {
         let mut inner = self.0.lock();
         if inner.op_result.is_ready() {
@@ -349,8 +336,6 @@ where
 {
     type Output = Result<()>;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        // it's safe to get a ref to the waker context through a non-exclusive pointer despite any existing exclusive access,
-        // because it is internally protected by a mutex
         let waker_ctx = self.buf_handle.shared_header();
         match waker_ctx.poll(cx.waker()) {
             Poll::Pending => Poll::Pending,

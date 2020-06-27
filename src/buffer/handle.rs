@@ -74,12 +74,13 @@ impl RawBufferHandle {
     pub(super) fn buffer_ref_count(&self) -> usize {
         unsafe {
             let header = self.buffer_header();
-            let owning_buffer_header = if let Some(owner) = header.chain_owner {
-                &*super::buffer::buffer_header_ptr(owner)
-            } else {
-                header
-            };
-            header.ref_count.load(Ordering::Relaxed)
+            let owning_buffer_header =
+                if let Some(owner) = NonNull::new(header.chain_owner.load(Ordering::Acquire)) {
+                    &*super::buffer::buffer_header_ptr(owner)
+                } else {
+                    header
+                };
+            header.ref_count.load(Ordering::Acquire)
         }
     }
     pub(super) unsafe fn buffer_header(&self) -> &BufferHeader {
@@ -94,8 +95,7 @@ impl RawBufferHandle {
 
     pub fn chain_owner(&self) -> Option<RawBufferHandle> {
         unsafe {
-            self.buffer_header()
-                .chain_owner
+            NonNull::new(self.buffer_header().chain_owner.load(Ordering::Acquire))
                 .map(|o| unsafe { make_handle(o) })
         }
     }
@@ -117,28 +117,38 @@ struct BufferUpgradeFuture<T> {
     handle: Option<BufferHandle<T>>,
 }
 
-// impl<T> Future for BufferUpgradeFuture<T> {
-//     type Output = BufferRef<T>;
-//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-//         // pin FML
-//         let mut buffer_handle = self.et_mut().handle.take().unwrap();
-//         match buffer_handle.try_upgrade(Some(cx.waker())) {
-//             Ok(buf_ref) => Poll::Ready(buf_ref),
-//             Err(original_handle) => {
-//                 self.handle.replace(original_handle);
-//                 Poll::Pending
-//             }
-//         }
-//     }
-// }
+impl<T: Unpin> Future for BufferUpgradeFuture<T> {
+    type Output = BufferRef<T>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut buffer_handle = self.as_mut().handle.take().unwrap();
+        match buffer_handle.try_upgrade(Some(cx.waker())) {
+            Ok(buf_ref) => Poll::Ready(buf_ref),
+            Err(original_handle) => {
+                self.handle.replace(original_handle);
+                Poll::Pending
+            }
+        }
+    }
+}
 
+impl<T: Unpin> BufferHandle<T> {
+    pub fn upgrade(mut self) -> impl Future<Output = BufferRef<T>> {
+        BufferUpgradeFuture { handle: Some(self) }
+    }
+}
 impl<T> BufferHandle<T> {
     pub fn raw(&self) -> &RawBufferHandle {
         &self.handle
     }
     pub fn chain_owner(&self) -> Option<BufferHandle<T>> {
         unsafe {
-            self.raw().buffer_header().chain_owner.map(|o| unsafe {
+            NonNull::new(
+                self.raw()
+                    .buffer_header()
+                    .chain_owner
+                    .load(Ordering::Acquire),
+            )
+            .map(|o| unsafe {
                 Self {
                     handle: make_handle(o),
                     marker: core::marker::PhantomData,
@@ -264,11 +274,12 @@ impl PartialEq<RawBufferHandle> for RawBufferHandle {
 // ptr must point to the data segment of an allocated buffer
 pub(super) unsafe fn make_handle(ptr: NonNull<u8>) -> RawBufferHandle {
     let header = &*super::buffer::buffer_header_ptr(ptr);
-    let owning_buffer_header = if let Some(owner) = header.chain_owner {
-        &*super::buffer::buffer_header_ptr(owner)
-    } else {
-        header
-    };
+    let owning_buffer_header =
+        if let Some(owner) = NonNull::new(header.chain_owner.load(Ordering::Acquire)) {
+            &*super::buffer::buffer_header_ptr(owner)
+        } else {
+            header
+        };
     assert!(
         owning_buffer_header
             .ref_count

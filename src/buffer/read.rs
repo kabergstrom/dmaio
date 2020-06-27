@@ -1,6 +1,7 @@
 use super::buffer::{buffer_data_ptr, buffer_header_ptr};
 use super::{RawBufferHandle, RawBufferRef};
 use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
 /// Implements `std::io::Read` for a BufferRef
 #[doc(hidden)]
 pub struct BufferReader<'a> {
@@ -28,7 +29,7 @@ impl<'a> std::io::Read for BufferReader<'a> {
                 self.chain_buffer_pos += to_read as u32;
                 bytes_read += to_read;
                 if to_read == bytes_remaining as usize {
-                    self.chain_iter = header.next;
+                    self.chain_iter = NonNull::new(header.next.load(Ordering::Relaxed));
                     unsafe {
                         self.chain_buffer_pos = self
                             .chain_iter

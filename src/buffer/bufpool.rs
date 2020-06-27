@@ -77,12 +77,12 @@ impl BufferPoolHeader {
                 ref_count: AtomicUsize::new(1),
                 ref_lock: AtomicBool::new(true),
                 ref_lock_waker: Default::default(),
-                next: None,
-                prev: None,
-                chain_owner: None,
-                bufpool: Some(NonNull::new_unchecked(
+                next: AtomicPtr::new(null_mut()),
+                prev: AtomicPtr::new(null_mut()),
+                chain_owner: AtomicPtr::new(null_mut()),
+                bufpool: NonNull::new_unchecked(
                     self as *const BufferPoolHeader as *mut BufferPoolHeader,
-                )),
+                ),
             },
         );
         self.ref_count.fetch_add(1, Ordering::Relaxed);

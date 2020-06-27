@@ -2,6 +2,7 @@ use super::buffer::{buffer_data_ptr, buffer_header_ptr, buffer_header_ptr_mut};
 use super::chain_iter::{chain_begin_ptr, ChainIterForwardPtr};
 use super::{BufferRef, RawBufferRef};
 use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
 
 pub(super) struct BufferWriter<'a> {
     buf_ref: &'a mut RawBufferRef,
@@ -53,7 +54,7 @@ impl<'a> std::io::Write for BufferWriter<'a> {
                 }
                 bytes_written += to_write;
                 if header.data_capacity() - header.data_size() == 0 {
-                    self.chain_iter = header.next;
+                    self.chain_iter = NonNull::new(header.next.load(Ordering::Relaxed));
                 }
                 if buf.len() - bytes_written == 0 {
                     break;

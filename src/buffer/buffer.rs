@@ -12,7 +12,7 @@ use crate::alloc::{
 };
 use crate::Result;
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
+use core::ptr::{null, null_mut, NonNull};
 
 /// Typed reference to a buffer and its header. Offers exclusive access to its contents
 pub struct BufferRef<T> {
@@ -46,15 +46,15 @@ unsafe impl UserHeader for () {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 #[doc(hidden)]
 /// Internal header segment that is stored packed before the data segment
 pub(crate) struct BufferHeader {
     pub ref_count: AtomicUsize, // number of references to the buffer by RawBufferRefs and BufferHandles
-    pub chain_owner: Option<NonNull<u8>>, // pointer to owning buffer in the chain
-    pub next: Option<NonNull<u8>>, // pointer to the next buffer in the chain
-    pub prev: Option<NonNull<u8>>, // pointer to the previous buffer in the chain
-    pub bufpool: Option<NonNull<BufferPoolHeader>>, // pointer to the header of the pool which owns this buffer
+    pub chain_owner: AtomicPtr<u8>, // pointer to owning buffer in the chain
+    pub next: AtomicPtr<u8>,    // pointer to the next buffer in the chain
+    pub prev: AtomicPtr<u8>,    // pointer to the previous buffer in the chain
+    pub bufpool: NonNull<BufferPoolHeader>, // pointer to the header of the pool which owns this buffer
     pub ref_lock_waker: futures_core::task::__internal::AtomicWaker,
     pub data_start_offset: u32, // offset from the start of the data segment
     pub data_size: u32, // size of data in the data segment, starting from data_ptr + data_start_offset
@@ -63,13 +63,7 @@ pub(crate) struct BufferHeader {
 }
 impl BufferHeader {
     pub fn data_segment_layout(&self) -> Layout {
-        unsafe {
-            (&*self
-                .bufpool
-                .expect("no buffer pool pointer set for an active buffer reference")
-                .as_ptr())
-                .buffer_layout()
-        }
+        unsafe { (&*self.bufpool.as_ptr()).buffer_layout() }
     }
     /// Available space in this buffer's data segment (capacity - start offset)
     pub fn data_capacity(&self) -> u32 {
@@ -116,7 +110,7 @@ impl<T> BufferRef<T> {
         let raw = self.raw_mut();
         let data_ptr = raw.data_ptr();
         let header = raw.buffer_header_mut();
-        if header.chain_owner.is_some() {
+        if header.chain_owner.load(Ordering::Relaxed) != null_mut() {
             todo!("try_reserve_front not implemented for buffer chains");
         }
         let bytes_remaining = header.data_capacity() - header.data_size();
@@ -135,7 +129,7 @@ impl<T> BufferRef<T> {
     }
     pub fn try_prepend_write(&mut self, buf: &[u8]) -> bool {
         let header = self.raw().buffer_header();
-        if header.chain_owner.is_some() {
+        if header.chain_owner.load(Ordering::Relaxed) != null_mut() {
             todo!("try_prepend_write not implemented for buffer chains");
         }
         let bytes_remaining = header.data_start_offset();
@@ -163,13 +157,19 @@ impl<T> BufferRef<T> {
         self.buffer_ref.reader()
     }
     pub fn chain_owner(&self) -> Option<BufferHandle<T>> {
-        self.raw()
+        let chain_owner = self
+            .raw()
             .buffer_header()
             .chain_owner
-            .map(|o| BufferHandle {
-                handle: unsafe { super::handle::make_handle(o) },
+            .load(Ordering::Relaxed);
+        if chain_owner != null_mut() {
+            Some(BufferHandle {
+                handle: unsafe { super::handle::make_handle(NonNull::new_unchecked(chain_owner)) },
                 marker: core::marker::PhantomData,
             })
+        } else {
+            None
+        }
     }
     pub fn chain_iter_forward(&self) -> ChainIterForward<T> {
         ChainIterForward::new(self.make_handle())
@@ -268,9 +268,8 @@ impl RawBufferRef {
         }
     }
     pub fn chain_owner(&self) -> Option<RawBufferHandle> {
-        self.buffer_header()
-            .chain_owner
-            .map(|o| unsafe { super::handle::make_handle(o) })
+        NonNull::new(self.buffer_header().chain_owner.load(Ordering::Relaxed))
+            .map(|chain_owner| unsafe { super::handle::make_handle(chain_owner) })
     }
     pub fn chain_iter_forward(&self) -> ChainIterForwardRaw {
         ChainIterForwardRaw::new(self.make_handle())
@@ -304,8 +303,12 @@ impl RawBufferRef {
             let mut chain_begin = super::chain_iter::chain_begin_ptr(self.ptr);
             let mut chain_end = super::chain_iter::chain_end_ptr(buffer.ptr);
             // it's assumed safe to modify the buffer headers in the chain since we have mutable access to self and buffer
-            (&mut *buffer_header_ptr_mut(chain_begin)).prev = Some(chain_end);
-            (&mut *buffer_header_ptr_mut(chain_end)).next = Some(chain_begin);
+            (&mut *buffer_header_ptr_mut(chain_begin))
+                .prev
+                .store(chain_end.as_ptr(), Ordering::Relaxed);
+            (&mut *buffer_header_ptr_mut(chain_end))
+                .next
+                .store(chain_begin.as_ptr(), Ordering::Release);
             // reduce the ref count of `buffer`, then forget it without dropping.
             // this is because `buffer` is no longer the exclusive reference to its chain,
             // so calling drop would cause it to drop the chain.
@@ -322,7 +325,9 @@ impl RawBufferRef {
             let mut chain_iter = super::chain_iter::ChainIterReversePtr::new(chain_begin);
             while let Some(buffer_ptr) = chain_iter.next() {
                 let buffer_header = &mut *buffer_header_ptr_mut(buffer_ptr);
-                buffer_header.chain_owner = Some(self.ptr);
+                buffer_header
+                    .chain_owner
+                    .store(self.ptr.as_ptr(), Ordering::Release);
             }
         }
     }
@@ -336,8 +341,12 @@ impl RawBufferRef {
             let mut chain_begin = super::chain_iter::chain_begin_ptr(buffer.ptr);
             let mut chain_end = super::chain_iter::chain_end_ptr(self.ptr);
             // it's assumed safe to modify the buffer headers in the chain since we have mutable access to self and buffer
-            (&mut *buffer_header_ptr_mut(chain_begin)).prev = Some(chain_end);
-            (&mut *buffer_header_ptr_mut(chain_end)).next = Some(chain_begin);
+            (&mut *buffer_header_ptr_mut(chain_begin))
+                .prev
+                .store(chain_end.as_ptr(), Ordering::Relaxed);
+            (&mut *buffer_header_ptr_mut(chain_end))
+                .next
+                .store(chain_begin.as_ptr(), Ordering::Release);
             // reduce the ref count of `buffer`, then forget it without dropping.
             // this is because `buffer` is no longer the exclusive reference to its chain,
             // so calling drop would cause it to drop the chain.
@@ -354,7 +363,9 @@ impl RawBufferRef {
             let mut chain_iter = super::chain_iter::ChainIterForwardPtr::new(chain_end);
             while let Some(buffer_ptr) = chain_iter.next() {
                 let buffer_header = &mut *buffer_header_ptr_mut(buffer_ptr);
-                buffer_header.chain_owner = Some(self.ptr);
+                buffer_header
+                    .chain_owner
+                    .store(self.ptr.as_ptr(), Ordering::Release);
             }
         }
     }
@@ -382,13 +393,13 @@ pub(super) fn buffer_data_ptr(header: &BufferHeader, buffer_ptr: NonNull<u8>) ->
     buffer_ptr
 }
 unsafe fn drop_buffer_chain(buf_ptr: NonNull<u8>, header: &mut BufferHeader) {
-    if let Some(next) = header.next {
+    if let Some(next) = NonNull::new(header.next.load(Ordering::Acquire)) {
         let mut chain_iter = super::chain_iter::ChainIterForwardPtr::new(next);
         while let Some(buffer) = chain_iter.next() {
             free_buffer(buffer);
         }
     }
-    if let Some(prev) = header.prev {
+    if let Some(prev) = NonNull::new(header.prev.load(Ordering::Acquire)) {
         let mut chain_iter = super::chain_iter::ChainIterReversePtr::new(prev);
         while let Some(buffer) = chain_iter.next() {
             free_buffer(buffer);
@@ -398,7 +409,7 @@ unsafe fn drop_buffer_chain(buf_ptr: NonNull<u8>, header: &mut BufferHeader) {
 // runs the drop logic for a buffer reference (exclusive or non-exclusive) and returns whether the buffer was dropped
 pub(super) unsafe fn drop_buffer(buf_ptr: NonNull<u8>) {
     let header = &*buffer_header_ptr(buf_ptr);
-    if let Some(owner) = header.chain_owner {
+    if let Some(owner) = NonNull::new(header.chain_owner.load(Ordering::Acquire)) {
         if owner != buf_ptr {
             // if we're dropping a buffer owned by another buffer,
             // drop as if it's a reference to the owning buffer
@@ -406,7 +417,7 @@ pub(super) unsafe fn drop_buffer(buf_ptr: NonNull<u8>) {
             return;
         }
     }
-    if header.ref_count.fetch_sub(1, Ordering::Acquire) == 1 {
+    if header.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
         let header = &mut *buffer_header_ptr_mut(buf_ptr);
         drop_buffer_chain(buf_ptr, header);
         free_buffer(buf_ptr);
@@ -414,15 +425,9 @@ pub(super) unsafe fn drop_buffer(buf_ptr: NonNull<u8>) {
 }
 unsafe fn free_buffer(buf_ptr: NonNull<u8>) {
     let header = &mut *buffer_header_ptr_mut(buf_ptr);
-    let bufpool_ptr = header.bufpool;
-
-    let bufpool_ref = header.bufpool.expect("no bufpool set in BufferRef drop");
+    let bufpool_ref = header.bufpool;
     // free ourself
-    let bufpool_header = header
-        .bufpool
-        .take()
-        .expect("no bufpool set in BufferRef drop");
-    bufpool_header
+    let bufpool_header = bufpool_ref
         .as_ref()
         .free_bufref(RawBufferRef::from_raw(buf_ptr));
     super::bufpool::decrement_refcount(bufpool_ref);

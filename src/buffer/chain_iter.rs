@@ -9,7 +9,7 @@ use crate::alloc::{
 };
 use crate::Result;
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
+use core::ptr::{null_mut, NonNull};
 
 pub struct ChainIterForward<T> {
     current: Option<BufferHandle<T>>,
@@ -27,9 +27,11 @@ impl<T> Iterator for ChainIterForward<T> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.current.take() {
             self.current = unsafe {
-                curr.raw().buffer_header().next.map(|ptr| BufferHandle {
-                    handle: super::handle::make_handle(ptr),
-                    marker: core::marker::PhantomData,
+                NonNull::new(curr.raw().buffer_header().next.load(Ordering::Acquire)).map(|ptr| {
+                    BufferHandle {
+                        handle: super::handle::make_handle(ptr),
+                        marker: core::marker::PhantomData,
+                    }
                 })
             };
             Some(curr)
@@ -55,9 +57,11 @@ impl<T> Iterator for ChainIterReverse<T> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.current.take() {
             self.current = unsafe {
-                curr.raw().buffer_header().prev.map(|ptr| BufferHandle {
-                    handle: super::handle::make_handle(ptr),
-                    marker: core::marker::PhantomData,
+                NonNull::new(curr.raw().buffer_header().prev.load(Ordering::Acquire)).map(|ptr| {
+                    BufferHandle {
+                        handle: super::handle::make_handle(ptr),
+                        marker: core::marker::PhantomData,
+                    }
                 })
             };
             Some(curr)
@@ -83,8 +87,7 @@ impl Iterator for ChainIterForwardRaw {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.current.take() {
             self.current = unsafe {
-                curr.buffer_header()
-                    .next
+                NonNull::new(curr.buffer_header().next.load(Ordering::Acquire))
                     .map(|ptr| super::handle::make_handle(ptr))
             };
             Some(curr)
@@ -110,8 +113,7 @@ impl Iterator for ChainIterReverseRaw {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.current.take() {
             self.current = unsafe {
-                curr.buffer_header()
-                    .prev
+                NonNull::new(curr.buffer_header().prev.load(Ordering::Acquire))
                     .map(|ptr| super::handle::make_handle(ptr))
             };
             Some(curr)
@@ -134,7 +136,11 @@ impl Iterator for ChainIterForwardPtr {
     type Item = NonNull<u8>;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.current.take() {
-            self.current = unsafe { &*super::buffer::buffer_header_ptr(curr) }.next;
+            self.current = NonNull::new(
+                unsafe { &*super::buffer::buffer_header_ptr(curr) }
+                    .next
+                    .load(Ordering::Acquire),
+            );
             Some(curr)
         } else {
             None
@@ -155,7 +161,11 @@ impl Iterator for ChainIterReversePtr {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.current.take() {
             // safe since we keep a borrow with the BufferRef
-            self.current = unsafe { &*super::buffer::buffer_header_ptr(curr) }.prev;
+            self.current = NonNull::new(
+                unsafe { &*super::buffer::buffer_header_ptr(curr) }
+                    .prev
+                    .load(Ordering::Acquire),
+            );
             Some(curr)
         } else {
             None
@@ -166,8 +176,11 @@ impl Iterator for ChainIterReversePtr {
 pub(super) unsafe fn chain_begin_ptr(ptr: NonNull<u8>) -> NonNull<u8> {
     let mut buffer_iter = ptr;
     loop {
-        if let Some(prev) = (&*super::buffer::buffer_header_ptr(buffer_iter)).prev {
-            buffer_iter = prev;
+        let prev = (&*super::buffer::buffer_header_ptr(buffer_iter))
+            .prev
+            .load(Ordering::Acquire);
+        if prev != null_mut() {
+            buffer_iter = NonNull::new_unchecked(prev);
         } else {
             break buffer_iter;
         }
@@ -176,7 +189,11 @@ pub(super) unsafe fn chain_begin_ptr(ptr: NonNull<u8>) -> NonNull<u8> {
 pub(super) unsafe fn chain_end_ptr(ptr: NonNull<u8>) -> NonNull<u8> {
     let mut buffer_iter = ptr;
     loop {
-        if let Some(next) = (&*super::buffer::buffer_header_ptr(buffer_iter)).next {
+        if let Some(next) = NonNull::new(
+            (&*super::buffer::buffer_header_ptr(buffer_iter))
+                .next
+                .load(Ordering::Acquire),
+        ) {
             buffer_iter = next;
         } else {
             break buffer_iter;

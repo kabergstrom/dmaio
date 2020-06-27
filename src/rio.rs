@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 use crate::alloc::sync::Arc;
 use crate::buffer::{BufferRef, RawBufferRef, UserHeader};
+use crate::iocp::IOCPHeader;
 use crate::rio_buf::RIOPacketBuf;
 use crate::{Error, Result};
 use core::mem::{size_of, MaybeUninit};
@@ -282,6 +283,7 @@ pub unsafe fn init_rio() -> Result<()> {
         Ok(())
     }
 }
+pub const IOCP_ACCEPT_EX_KEY: usize = 0xDEEC;
 
 struct RIOSocketState {
     pub send_slots_open: u32,
@@ -292,6 +294,8 @@ struct RIOSocketState {
 
 struct RIOSocketInner {
     pub socket: SOCKET,
+    pub ty: c_int,
+    pub protocol: c_int,
     pub rq: RIO_RQ,
     pub send_cq: RIOQueue,
     pub receive_cq: RIOQueue,
@@ -381,6 +385,8 @@ impl RIOSocket {
             }
             Ok((socket, rq)) => Ok(RIOSocket(Arc::new(RIOSocketInner {
                 socket,
+                ty: _type,
+                protocol,
                 rq,
                 send_cq: send_queue.clone(),
                 receive_cq: receive_queue.clone(),
@@ -393,6 +399,53 @@ impl RIOSocket {
                     pending_send_wakers: SmallVec::new(),
                 }),
             }))),
+        }
+    }
+
+    pub fn listen(&self, backlog: i32) -> Result<()> {
+        unsafe {
+            if winsock2::listen(self.0.socket, backlog) != 0 {
+                Err(wsa_err("listen"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    pub fn accept_ex<T: UserHeader>(&self, mut packet: BufferRef<T>) -> Result<()>
+    where
+        <T as UserHeader>::Mutable: AsMut<IOCPHeader>,
+    {
+        todo!("make a IOCPHandler, make a future stream");
+        unsafe {
+            assert!(
+                packet.raw().buffer_header().data_capacity() as usize
+                    > size_of::<ws2def::SOCKADDR_STORAGE>() * 2
+            );
+            let socket = create_socket(
+                self.0.ty,
+                self.0.protocol,
+                winsock2::WSA_FLAG_REGISTERED_IO | winsock2::WSA_FLAG_OVERLAPPED,
+            )?;
+            let data_ptr = packet.raw().data_ptr();
+            let iocp_header = packet.mut_header::<IOCPHeader>();
+            iocp_header.initialize(data_ptr, IOCP_ACCEPT_EX_KEY);
+            if winapi::um::mswsock::AcceptEx(
+                self.0.socket,
+                socket,
+                data_ptr.as_ptr() as PVOID,
+                0,
+                size_of::<ws2def::SOCKADDR_STORAGE>() as u32,
+                size_of::<ws2def::SOCKADDR_STORAGE>() as u32,
+                null_mut(),
+                iocp_header.overlapped_ptr(),
+            ) != 0
+            {
+                winsock2::closesocket(socket);
+                Err(wsa_err("accept_ex"))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -665,7 +718,7 @@ struct RIOQueueState {
 pub(crate) struct RIOQueueInner {
     // this OVERLAPPED struct is used when the RIO_CQ is bound with an IO Completion Port,
     // and a pointer to it will be passed in the IO completion packet by RIONotify
-    iocp_overlapped: MaybeUninit<OVERLAPPED>,
+    iocp_header: MaybeUninit<IOCPHeader>,
     cq: RIO_CQ,
     state: Mutex<RIOQueueState>,
 }
@@ -674,8 +727,8 @@ unsafe impl Sync for RIOQueueInner {}
 #[derive(Clone)]
 pub struct RIOQueue(Arc<RIOQueueInner>);
 impl RIOQueue {
-    pub unsafe fn from_overlapped(overlapped: &OVERLAPPED) -> Self {
-        let overlapped_value = Arc::from_raw(*overlapped.u.Pointer() as *const RIOQueueInner);
+    pub(crate) unsafe fn from_overlapped_ptr(ptr: *mut u8) -> Self {
+        let overlapped_value = Arc::from_raw(ptr as *mut RIOQueueInner);
         let retval = RIOQueue(Arc::clone(&overlapped_value));
         core::mem::forget(overlapped_value);
         retval
@@ -795,7 +848,7 @@ unsafe fn create_rio_cq(
     results_buffer_size: usize,
 ) -> Result<Arc<RIOQueueInner>> {
     let mut rio_queue_alloc = Arc::new(RIOQueueInner {
-        iocp_overlapped: MaybeUninit::zeroed(),
+        iocp_header: MaybeUninit::zeroed(),
         cq: RIO_INVALID_CQ,
         state: Mutex::new(RIOQueueState {
             results_buffer: Vec::with_capacity(results_buffer_size),
@@ -803,13 +856,14 @@ unsafe fn create_rio_cq(
             socket_slots_total: queue_size,
         }),
     });
+    let iocp_header_ptr = rio_queue_alloc.iocp_header.as_ptr() as *mut IOCPHeader;
+    let overlapped_ptr = (&*iocp_header_ptr).overlapped_ptr();
     let mut iocp_registration = RIO_NOTIFICATION_COMPLETION::default();
     let notification = if let Some(iocp) = iocp_notify {
         iocp_registration.Type = RIO_IOCP_COMPLETION;
         iocp_registration.u.Iocp_mut().IocpHandle = iocp;
         iocp_registration.u.Iocp_mut().CompletionKey = completion_key as PVOID;
-        iocp_registration.u.Iocp_mut().Overlapped =
-            rio_queue_alloc.iocp_overlapped.as_ptr() as *mut _;
+        iocp_registration.u.Iocp_mut().Overlapped = overlapped_ptr as PVOID;
         &mut iocp_registration as *mut _
     } else {
         null_mut()
@@ -817,12 +871,13 @@ unsafe fn create_rio_cq(
     // this is sound since we have the only ref to the Arc
     *(&rio_queue_alloc.cq as *const RIO_CQ as *mut RIO_CQ) =
         rio_vtable().CreateCompletionQueue(queue_size as u32, notification)?;
-    let mut overlapped = OVERLAPPED::default();
-    *overlapped.u.Pointer_mut() = Arc::into_raw(Arc::clone(&rio_queue_alloc)) as PVOID;
-    core::ptr::write(
-        rio_queue_alloc.iocp_overlapped.as_ptr() as *mut OVERLAPPED,
-        overlapped,
+    let mut iocp_header = IOCPHeader::default();
+    let queue_arc_ptr = Arc::into_raw(Arc::clone(&rio_queue_alloc));
+    iocp_header.initialize(
+        NonNull::new_unchecked(queue_arc_ptr as *const u8 as *mut u8),
+        0,
     );
+    core::ptr::write(iocp_header_ptr, iocp_header);
     Ok(rio_queue_alloc)
 }
 

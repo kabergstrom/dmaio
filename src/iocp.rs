@@ -3,7 +3,7 @@ use crate::alloc::sync::Arc;
 use crate::{Error, Result};
 use core::future::Future;
 use core::mem::size_of;
-use core::ptr::null_mut;
+use core::ptr::{null_mut, NonNull};
 use winapi::{
     ctypes::c_int,
     shared::{
@@ -15,7 +15,7 @@ use winapi::{
         errhandlingapi::GetLastError,
         handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
         ioapiset,
-        minwinbase::{LPOVERLAPPED, OVERLAPPED_ENTRY},
+        minwinbase::{LPOVERLAPPED, OVERLAPPED, OVERLAPPED_ENTRY},
         winbase::INFINITE,
         winnt::HANDLE,
         winsock2::{self},
@@ -26,6 +26,29 @@ pub trait IOCPHandler {
     fn handle_completion(&self, entry: &OVERLAPPED_ENTRY) -> Result<()>;
 }
 
+#[derive(Default)]
+pub struct IOCPHeaderPayload {
+    pub ptr: Option<NonNull<u8>>,
+    pub completion_key: usize,
+}
+#[derive(Default)]
+pub struct IOCPHeader {
+    overlapped: OVERLAPPED,
+    payload: IOCPHeaderPayload,
+}
+impl IOCPHeader {
+    pub unsafe fn initialize(&mut self, ptr: NonNull<u8>, completion_key: usize) {
+        self.payload.ptr = Some(ptr);
+        self.payload.completion_key = completion_key;
+    }
+    pub fn overlapped_ptr(&self) -> *mut OVERLAPPED {
+        &self.overlapped as *const OVERLAPPED as *mut OVERLAPPED
+    }
+    pub unsafe fn get_payload_ptr(overlapped: *const OVERLAPPED) -> *const IOCPHeaderPayload {
+        let header_ptr = overlapped as *const IOCPHeader;
+        &(&*header_ptr).payload as *const IOCPHeaderPayload
+    }
+}
 struct IOCPHandlerRegistration {
     completion_key: usize,
     obj: Box<dyn IOCPHandler + 'static>,
@@ -174,8 +197,14 @@ impl IOCPQueue {
                 // println!("entries {}", num_received_entries);
                 for i in 0..num_received_entries as usize {
                     let entry = completion_entries.get_unchecked(i);
+                    let key = if entry.lpCompletionKey == 0 {
+                        let payload = IOCPHeader::get_payload_ptr(entry.lpOverlapped);
+                        (&*payload).completion_key
+                    } else {
+                        entry.lpCompletionKey
+                    };
                     for handler in &self.0.registrations {
-                        if handler.completion_key == entry.lpCompletionKey {
+                        if key == handler.completion_key {
                             handler.obj.handle_completion(entry)?;
                         }
                     }

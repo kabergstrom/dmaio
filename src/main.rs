@@ -70,7 +70,7 @@ unsafe fn create_completion_port(max_thread_users: u32) -> Result<HANDLE> {
         Err(Error::CreateCompletionPortFailed)
     }
 }
-const PACKET_SIZE: u32 = 4096;
+const PACKET_SIZE: u32 = 1024;
 const SEND_OPS_IN_FLIGHT: u32 = 64;
 const RECV_OPS_IN_FLIGHT: u32 = 64;
 const SOCKET_BUF_SIZE: u32 = SEND_OPS_IN_FLIGHT * PACKET_SIZE * 16;
@@ -157,7 +157,7 @@ fn main() -> Result<()> {
         rio::wsa_init()?;
         rio::init_rio()?;
     }
-    let num_threads = 8;
+    let num_threads = 2;
     let mut iocp_queues = Vec::new();
     let num_receivers = 1;
     let packet_pool = buffer::default_pool(
@@ -206,7 +206,7 @@ fn main() -> Result<()> {
     for mut iocp in iocp_queues {
         threads.push(std::thread::spawn(move || -> Result<()> {
             loop {
-                if iocp.poll(Some(10)).unwrap() {
+                if iocp.poll(None).unwrap() {
                     // net_context.poke().unwrap();
                 }
             }
