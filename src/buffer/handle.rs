@@ -64,6 +64,7 @@ impl RawBufferHandle {
                 Err(_) => {
                     if let Some(waker) = waker {
                         header.ref_lock_waker.register(waker);
+                        println!("waiting for upgrade");
                         return self.try_upgrade(None);
                     }
                     Err(self)
@@ -116,8 +117,9 @@ impl RawBufferHandle {
 struct BufferUpgradeFuture<T> {
     handle: Option<BufferHandle<T>>,
 }
+impl<T> Unpin for BufferUpgradeFuture<T> {}
 
-impl<T: Unpin> Future for BufferUpgradeFuture<T> {
+impl<T> Future for BufferUpgradeFuture<T> {
     type Output = BufferRef<T>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut buffer_handle = self.as_mut().handle.take().unwrap();
@@ -125,13 +127,14 @@ impl<T: Unpin> Future for BufferUpgradeFuture<T> {
             Ok(buf_ref) => Poll::Ready(buf_ref),
             Err(original_handle) => {
                 self.handle.replace(original_handle);
+                println!("buffer upgrade waiting");
                 Poll::Pending
             }
         }
     }
 }
 
-impl<T: Unpin> BufferHandle<T> {
+impl<T> BufferHandle<T> {
     pub fn upgrade(mut self) -> impl Future<Output = BufferRef<T>> {
         BufferUpgradeFuture { handle: Some(self) }
     }

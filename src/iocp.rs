@@ -36,8 +36,11 @@ pub struct IOCPHeader {
     overlapped: OVERLAPPED,
     payload: IOCPHeaderPayload,
 }
+unsafe impl Send for IOCPHeader {}
+unsafe impl Sync for IOCPHeader {}
 impl IOCPHeader {
-    pub unsafe fn initialize(&mut self, ptr: NonNull<u8>, completion_key: usize) {
+    pub fn initialize(&mut self, ptr: NonNull<u8>, completion_key: usize) {
+        self.overlapped = OVERLAPPED::default();
         self.payload.ptr = Some(ptr);
         self.payload.completion_key = completion_key;
     }
@@ -56,20 +59,22 @@ struct IOCPHandlerRegistration {
 pub struct IOCPQueueBuilder {
     handlers: Vec<IOCPHandlerRegistration>,
     completion_buffer_size: usize,
-    iocp_handle: Option<HANDLE>,
+    iocp_handle: IOCPQueueHandle,
 }
 impl IOCPQueueBuilder {
     pub fn new(thread_users: u32) -> Result<Self> {
         let mut this = Self {
             handlers: Vec::new(),
             completion_buffer_size: 1024,
-            iocp_handle: Some(unsafe { create_completion_port(thread_users)? }),
+            iocp_handle: IOCPQueueHandle(Arc::new(IOCPQueueHandleInner(unsafe {
+                create_completion_port(thread_users)?
+            }))),
         };
         this.register_handler(IOCP_FUTURE_SCHEDULE_KEY, IOCPFutureScheduler);
         Ok(this)
     }
-    pub fn iocp_handle(&self) -> HANDLE {
-        self.iocp_handle.unwrap()
+    pub fn handle(&self) -> IOCPQueueHandle {
+        self.iocp_handle.clone()
     }
     pub fn set_completion_buffer_size(&mut self, size: usize) -> &mut Self {
         self.completion_buffer_size = size;
@@ -101,7 +106,7 @@ impl IOCPQueueBuilder {
             .map(|handler| handler.obj.as_ref() as *const dyn IOCPHandler)
             .collect();
         let inner = IOCPQueueInner {
-            handle: self.iocp_handle.take().unwrap(),
+            handle: self.iocp_handle,
             registrations: self.handlers,
             call_table,
         };
@@ -111,27 +116,22 @@ impl IOCPQueueBuilder {
         ))
     }
 }
-impl IOCPQueueBuilder {
+struct IOCPQueueHandleInner(HANDLE);
+unsafe impl Send for IOCPQueueHandleInner {}
+unsafe impl Sync for IOCPQueueHandleInner {}
+#[derive(Clone)]
+pub struct IOCPQueueHandle(Arc<IOCPQueueHandleInner>);
+impl Drop for IOCPQueueHandleInner {
     fn drop(&mut self) {
-        if let Some(handle) = self.iocp_handle {
-            unsafe { CloseHandle(handle) };
-        }
+        unsafe { CloseHandle(self.0) };
     }
 }
-
 struct IOCPQueueInner {
-    handle: HANDLE,
+    handle: IOCPQueueHandle,
     registrations: Vec<IOCPHandlerRegistration>,
     call_table: Vec<*const dyn IOCPHandler>,
 }
-impl Drop for IOCPQueueInner {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.handle) };
-    }
-}
 
-#[derive(Clone)]
-pub struct IOCPQueueHandle(Arc<IOCPQueueInner>);
 struct IOCPFutureScheduler;
 impl IOCPHandler for IOCPFutureScheduler {
     fn handle_completion(&self, entry: &OVERLAPPED_ENTRY) -> Result<()> {
@@ -148,7 +148,7 @@ impl IOCPQueueHandle {
         &self,
         future: F,
     ) -> JoinHandle<R> {
-        let handle = self.0.handle as usize;
+        let handle = unsafe { self.raw() } as usize;
         let (task, join_handle) = async_task::spawn(
             future,
             move |task| unsafe {
@@ -166,6 +166,17 @@ impl IOCPQueueHandle {
         task.schedule();
         join_handle
     }
+    pub unsafe fn raw(&self) -> HANDLE {
+        (self.0).0
+    }
+    pub unsafe fn associate_handle(&self, handle: HANDLE, completion_key: usize) -> Result<()> {
+        let ret_val = ioapiset::CreateIoCompletionPort(handle, self.raw(), completion_key, 0);
+        if ret_val == null_mut() {
+            Err(Error::AssociateCompletionPortFailed)
+        } else {
+            Ok(())
+        }
+    }
 }
 pub struct IOCPQueue(Arc<IOCPQueueInner>, Vec<OVERLAPPED_ENTRY>);
 unsafe impl Send for IOCPQueue {}
@@ -177,7 +188,7 @@ impl Clone for IOCPQueue {
 
 impl IOCPQueue {
     pub fn handle(&self) -> IOCPQueueHandle {
-        IOCPQueueHandle(self.0.clone())
+        self.0.handle.clone()
     }
     #[inline]
     pub fn poll(&mut self, timeout_ms: Option<u32>) -> Result<bool> {
@@ -185,7 +196,7 @@ impl IOCPQueue {
             let completion_entries = &mut self.1;
             let mut num_received_entries = 0;
             let ret_val = ioapiset::GetQueuedCompletionStatusEx(
-                self.0.handle,
+                self.0.handle.raw(),
                 completion_entries.as_mut_ptr(),
                 completion_entries.capacity() as ULONG,
                 &mut num_received_entries,
